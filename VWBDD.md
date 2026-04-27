@@ -14,15 +14,16 @@ Across the mult-relation `x*y=z` from k=2 to k=11 (reachable nodes 29 to 7.6M):
 
 - **Correctness**: node counts match OxiDD exactly at every scale, verified differentially via a shared bitblaster running both engines in the same test.
 - **Arena compression**: post-GC, we store BDD nodes at **2.6 to 4.6 bytes each** (k=2 to k=11) vs OxiDD's fixed 16 B/node. Dominant factor is the byte-offset distance to child nodes, which LEB128 compresses well.
-- **Unique-table compression** (§4.7): `CompactUnique` — `Vec<u32>` offsets + parallel `Vec<u8>` hash tags, 5 B/slot at 0.75 load. Exploits that node offsets always fit in 32 bits (arena < 4 GB at any practical k). **~6.7 B/node**, down from 32 B/node for hashbrown.
-- **Apply-cache compression** (§4.8): a 4-byte `PackedRef` lets each direct-mapped cache entry fit in 16 B (exactly one cache line), down from 72 B. Cache total: 9 MB → **2 MB**.
+- **Parameterized engine** (§4.12): `Manager<C: NodeCodec, O: ArenaOffset>`. Default `DefaultManager = Manager<Leb128Codec, u32>` is the compact build (4 GiB arena cap, ~6.7 B/node unique-table density — right for wasm clients and other memory-tight deployments). `LargeManager = Manager<Leb128Codec, u64>` lifts the arena ceiling to host RAM for server-side builders, at ~12 B/node density. Single library, two monomorphizations, picked by type alias at the call site.
+- **Unique-table compression** (§4.7): `CompactUnique` — struct-of-arrays offset slots + parallel hash tags. u32 default at **~6.7 B/node**; u64 large-arena at **~12 B/node**. Both far below the 32 B/node a generic `HashMap<u64,u64>` would cost.
+- **Apply-cache compression** (§4.8, §4.11): a packed-ref encoding per offset width. Default (u32) gives 16 B entries (one 64 B cache line); u64 gives 32 B entries (two per line). Default cache total: **2 MB**. Large-arena cache total: 4 MB.
 - **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
-- **Total live memory**: **~15 B/node** (arena + unique table), plus a 2 MB fixed apply cache. Grand total at k=11: **~15.9 B/live-node**. **Half of OxiDD's ~30-32 B/live-node.**
-- **Wall-clock time**: **~2× slower than OxiDD** at k=11. Down from 10.8× in v0.
+- **Total live memory (default build)**: **~15-16 B/node** (arena + unique table), plus a 2 MB fixed apply cache. Grand total at k=11: **~121 MB for 7.6M nodes**. About half of OxiDD's ~30-32 B/live-node.
+- **Wall-clock time**: **1.75× slower than OxiDD** at k=11 on the default build (§4.12 post-parameterization; the monomorphized u32 engine is 14-21% faster than the single-width u64 engine of §4.11).
 
-**Design trade-off, accepted explicitly**: within ~3× of OxiDD on runtime in exchange for **~2× smaller total engine footprint**. For the intended workload — compressed BDDs for FDG reachability on fixed laptop hardware, where working-set size determines whether a problem fits at all — this is the right trade. At k=11, vwbdd holds 7.6M nodes in ~121 MB total; OxiDD needs ~244 MB. A problem that OOMs in OxiDD on a 256 MB budget still runs here.
+**Design trade-off, accepted explicitly**: within ~3× of OxiDD on runtime, at ~half OxiDD's total engine memory *and* unlimited-arena scaling when you need it. The §4.12 parameterization removed the prior either/or: no longer does the server-side build and the wasm-client build have to choose between compactness and capacity. The wasm client runs `DefaultManager` at 15-16 B/node with a 4 GiB arena ceiling; the server builds with `LargeManager` at ~25 B/node and can absorb up to ~40B live nodes in 1 TB of RAM. The serialized arena is codec-compatible across widths because `Leb128Codec` encodes the same bytes either way; the receiving engine just uses its own offset type to index them.
 
-Three rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design.
+Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design. §4.11 records the u32 → u64 widening that lifted the 4 GiB arena ceiling (but ran into footprint regression on small cases). §4.12 resolved that tension with a compile-time parameterization.
 
 
 ## 1. Motivation
@@ -537,6 +538,93 @@ The speedup is large at small k (where `var_of` fraction is highest) and shrinks
 Post-simplification: `src/` is 918 LOC across four files (leb, node, unique, manager). `tests/` is 1331 LOC across ten files. Single-file pedagogical aesthetic preserved where it paid off, per-file separation where it clarified.
 
 
+### 4.11 Removing the 4 GiB ceiling: u64 offsets everywhere
+
+§4.7 (`CompactUnique`) and §4.8 (`PackedRef`) both pushed density by packing arena offsets into u32. Perfectly reasonable at the scales we were running (7.6M nodes / 34 MB arena at k=11), but the ceiling was real: arena > 4 GiB would trip a `debug_assert` in the unique table's insert and silently wrap in a release build. A BDD engine meant to absorb as much RAM as a machine has (up to ~1 TB on our target laptop) can't leave that landmine in place.
+
+The change is structural but uninteresting in design terms: widen both `CompactUnique::slots` and `PackedRef` from u32 to u64. Everything else stays the same: slot-value-0-means-empty for `CompactUnique`; `0/1/2` sentinels for `PackedRef::FALSE/TRUE/EMPTY` followed by `3..=u64::MAX` for node offsets. The `IteCacheEntry` grows from 16 B (exactly one 64 B cache line) to 32 B (two entries per line).
+
+**Measurements** — mult `x*y=z` sweep at k=8..11, post-GC:
+
+| k | nodes | vwbdd u32 (ms) | vwbdd u64 (ms) | Δ speed | total B/n u32 | total B/n u64 | Δ mem |
+|--:|---:|---:|---:|---:|---:|---:|---:|
+| 8  | 122k | 129 | 112 | -13% | 14.66 | 23.35 | +59% |
+| 9  | 484k | 614 | 570 | -7% | 14.94 | 23.58 | +58% |
+| 10 | 1.9M | 4,718 | 4,488 | -5% | 15.34 | 24.15 | +57% |
+| 11 | 7.6M | 39,386 | 37,262 | -5% | 15.64 | 24.50 | +57% |
+
+Two surprises in the data:
+
+1. **Speed improved slightly.** The u64 build is 5-13% *faster* than u32 across all k. Best guess: fewer narrowing conversions in the hot loops (the u32 slot-read used to immediately widen to u64 for arithmetic; the u32 PackedRef widened on unpack), and the doubled apply cache (4 MiB vs 2 MiB) pays back more of the thrashing at k ≥ 10. I did not expect a speedup to fall out of a straightforward widening, but it did, consistently.
+
+2. **Memory cost is larger than I estimated from slot-width alone.** 4 B/slot × 1.33 slot inflation = ~5 B/node of expected growth; actual growth is ~9 B/node. The extra comes from the unique table's power-of-two sizing: at the 7.6M-entry mark, the next pow2 that holds 10.1M slots (0.75 load) is 2^24 = 16.8M slots — roughly 2× more slots than strictly needed. That inflation was already present at u32 (it's why post-§4.7 we landed at ~11-12 B/node instead of the theoretical 6.7 B/node), but widening the slot made the inflation more expensive in absolute terms.
+
+**Engine total at k=11**: arena 34.9 MB + unique ~151 MB + apply cache 4 MB = **~190 MB (25 B/live-node)**, vs OxiDD at ~30-32 B/live-node. Still a ~20% memory win, down from the previous ~2× win. The trade was bought consciously: the 4 GiB arena ceiling came for free at the scales we'd measured but would have been catastrophic at the scales we actually want to reach.
+
+**Arithmetic for the target regime.** At 1 TB of RAM, with the current ~24-25 B/live-node total:
+
+| Component | Bytes per node | 1 TB budget supports |
+|---|---:|---:|
+| arena (LEB128-encoded) | ~5 | 200B nodes if arena alone |
+| unique table (u64 slots @ 0.75 load, pow2 inflated) | ~20 | 50B nodes if unique alone |
+| apply cache (fixed) | O(1) | negligible |
+| **combined** | ~25 | **~40B live nodes** |
+
+40 billion live BDD nodes in 1 TB. That's 2-3 orders of magnitude past anything in the BDD literature I've seen benchmarked as "large." The real question at those scales becomes whether `ite` wall-time scales linearly (and whether we need a per-level apply cache to resist thrashing), not whether the data structures fit.
+
+**The broader reading.** §4.7's "don't store the key in the slot" insight is robust across slot widths; we just moved along the space/time trade-off curve it defined. The u32 variant is the memory-optimal version of that design. The u64 variant is the RAM-scalable version. If a future session ever needs both — say, a heuristic "is this arena going to stay small?" decision made at `Manager::new()` — the generic treatment is straightforward (parameterize `CompactUnique<Off>` and `PackedRef<Off>` over an `ArenaOffset` trait). We haven't done that because the measurements don't demand it: u64 gives up 9 B/node of density for a 7-13% speed *improvement* and unlimited arena headroom, and there's no scale between "small enough that the 4 GiB cap never mattered anyway" and "large enough that u64 is mandatory" where the u32 variant is strictly better.
+
+The 4 GiB ceiling was an artifact of the measurement regime we were optimizing in. Lifting it cost us the "2× smaller than OxiDD" framing but preserved every structural claim: verify-on-decode unique table, single-line (well, double-line now) direct-mapped apply cache, variable-width arena compression, copying GC. The engine still fits more nodes per byte than any fixed-16-B/node design.
+
+
+### 4.12 Keeping both: `Manager<C: NodeCodec, O: ArenaOffset>`
+
+§4.11 shipped the u64 widening as the only build. Within a session, a user question flipped that decision: a wasm client will never have more than 4 GiB of heap, but a server-side BDD builder preparing a diagram to ship *to* that client might need tens of GiB. Both use cases are real, and they want different engine footprints. One binary shouldn't have to pick.
+
+The change is a straightforward monomorphization refactor, but it rearranges the module structure enough to be worth recording.
+
+**The trait boundary that emerged.** Two axes, both orthogonal:
+
+1. `trait ArenaOffset`: the numeric type used for arena byte offsets. Implemented for `u32` and `u64`. The surface area is deliberately minimal (`ZERO`, `ONE`, `from_u64`/`to_u64`, checked arithmetic) because every use site was already doing one of those operations.
+
+2. `trait NodeCodec<O: ArenaOffset>`: how a `(var, lo, hi)` triple is laid out in bytes. Three methods — `encode`, `decode`, `decode_var` — because those were already the three functions `src/node.rs` exposed. Implementors are zero-sized types; the trait is stateless. `Leb128Codec` (the current design) is the one materialized impl. §4.10's rejected codecs (interleaved, fixed12, v_skip) would fit here without touching `Manager`; they're not in this cut because the A/B already said they lose.
+
+These are combined on `Manager<C: NodeCodec<O>, O: ArenaOffset>`. `CompactUnique<C, O>` and `IteCacheEntry<O>` travel along. `Ref<O>` and `Node<O>` are parameterized too — honest is better than hiding conversions at the arena boundary.
+
+**Default type parameters do the ergonomic work.** `Manager<C = Leb128Codec, O = u32>` lets every existing call site that writes `Manager::new()` keep working at the compact default. Two type aliases crystallize the common choices:
+
+```rust
+pub type DefaultManager = Manager<Leb128Codec, u32>;   // 4 GiB cap, compact
+pub type LargeManager   = Manager<Leb128Codec, u64>;   // host-RAM cap, wider
+```
+
+The `new()` method is defined as an inherent on the concrete `Manager<Leb128Codec, u32>` type rather than on the generic impl. This is the idiom that makes Rust's inference pick `Leb128Codec, u32` for bare `Manager::new()` calls; a generic `Manager<C, O>::new()` would leave the type parameters unresolved and force every call site to turbofish. Other configurations use `LargeManager::default()`.
+
+**What it cost and what it bought.** The parameterization touches every file in `src/` and adds one new file (`src/codec.rs`), but the hot paths are structurally unchanged — after monomorphization, the two instantiations compile to what the §4.7/§4.8 (u32) and §4.11 (u64) code paths did, respectively. No runtime dispatch, no dynamic checks.
+
+Measurements on mult `x*y=z`, default (u32) build, after parameterization:
+
+| k | §4.11 u64-only (ms) | §4.12 default (u32) (ms) | speedup | total B/n |
+|--:|---:|---:|---:|---:|
+| 8  | 112 | 98 | 13% | 14.78 |
+| 9  | 570 | 453 | 21% | 14.92 |
+| 10 | 4,488 | 3,671 | 18% | 15.40 |
+| 11 | 37,262 | 32,018 | 14% | 15.66 |
+
+The default build is **14-21% faster than the u64-only §4.11 engine at every k**, with memory density restored to the §4.8 baseline (~15-16 B/node at k=11). The compiler now emits 32-bit native ops on the u32 monomorphization instead of the u64 ops with narrowing casts that §4.11 required. Ratio to OxiDD at k=11: **1.75×**, the best we've ever measured.
+
+For the `LargeManager` (u64) configuration, timing stays close to §4.11's numbers (the monomorphization is essentially identical code), with the ceiling lifted. The two builds are strict Pareto improvements over the single-parameterization worlds each replaces:
+
+- Small-arena world: u32 default is faster than §4.11's u64-only (narrower ops) and lower-memory (smaller slots).
+- Large-arena world: u64 build reaches the same unlimited-ceiling that §4.11 promised.
+
+**Cross-width correctness test.** `tests/large_manager.rs` contains a `mult(k=4) = 498 nodes` assertion that runs on both widths and demands they agree. Canonicity is a property of the variable order, not the offset width; if a codec bug ever truncated an offset silently, that test would catch it.
+
+**Ref<O> in public API.** This was the one deliberate break: the `Ref` enum's `Node` variant now carries `O` rather than `u64`. All callers write either `Ref<u32>` (explicit) or `Ref` with default inferred. For tests and the differential harness that only run on `DefaultManager`, nothing changes; for `LargeManager` users, `Ref<u64>` is the honest type. Hiding the width behind a `u64` payload would have meant silent narrowing at every cache insert; exposing it means the compiler tells you where conversions would happen. The measurements above suggest that transparency was worth it.
+
+**What this doesn't yet give us.** Codec parameterization is scaffolded but not exercised. The next session that wants to revisit §4.10's codec A/B can add an `InterleavedCodec` and slot it into the same `Manager<InterleavedCodec, u32>` shape; no further `Manager` changes needed. Until then, `Leb128Codec` is the only codec shipped, and the trait's presence is mostly pedagogical — a clean boundary that says "this is the thing that changes when you experiment with node layouts."
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -547,7 +635,9 @@ Things we'd want before calling this a real engine:
 
 **Sat-count**, **pick-one**, **pick-iter**. Obvious extensions, well understood, no research needed.
 
-**Tunable / adaptive apply-cache size.** The fixed 2^17-slot direct-mapped cache (§4.5) is undersized at k ≥ 10 on mult (see §3.4's k=10 ratio peak). With §4.8's 16 B/entry, we could now cheaply double or quadruple the slot count without meaningful memory impact (4 MB or 8 MB total). `Manager::new_with_cache_size(n)` plus a sensible growth heuristic would flip the k=10 regime. Low risk, high payoff at large k.
+**Codec A/B harness.** §4.12 scaffolded the `NodeCodec<O>` trait but only materialized `Leb128Codec`. A future session revisiting §4.10 can add `InterleavedCodec`, `Fixed12Codec`, or `VSkipCodec` as type-parameter variants and run them head-to-head in a single test binary — no `Manager` changes needed. The path-dependent reason to skip this now is that §4.10's A/B already ruled those three out on the mult workload; the path-independent reason to do it later is a workload with different edge statistics (ROM data, §4.4's inspiration) might flip the answer.
+
+**Tunable / adaptive apply-cache size.** The fixed 2^17-slot direct-mapped cache (§4.5, §4.8) is undersized at k ≥ 10 on mult (see §3.4's k=10 ratio peak). Default build: 2 MB cache; LargeManager: 4 MB. Doubling or quadrupling the slot count is still trivial against a TB-scale arena budget. `Manager::new_with_cache_size(n)` plus a sensible growth heuristic would flip the k=10 regime. Low risk, high payoff at large k.
 
 **Decoded-node cache.** For very hot nodes (usually the ones near the roots of the current operation), cache the decoded `(var, lo, hi)` in a small fixed-width table to skip repeated LEB128 work. Not yet attempted.
 
@@ -562,17 +652,19 @@ Things we'd want before calling this a real engine:
 
 The variable-width hypothesis has three claims, each with a different verdict:
 
-**"Arena is much smaller."** True. **3.5-4× smaller** than OxiDD's node table across k=2..11 (see §3.4). With the §4.7 compact unique table, the win now extends to the full engine footprint, not just the arena: **~15 B/node total** vs OxiDD's ~32, a 2.1-2.4× shrink sustained across all tested scales.
+**"Arena is much smaller."** True. **3.5-4× smaller** than OxiDD's node table across k=2..11 (see §3.4). With the §4.7 compact unique table the win extended to the full engine footprint, and §4.12's parameterization restored it as the default: **~15-16 B/node total** on `DefaultManager` vs OxiDD's ~30-32. For the `LargeManager` build that lifts the 4 GiB arena ceiling, the trade is ~25 B/node — still smaller than OxiDD, now at any host-RAM scale.
 
-**"Smaller working set → faster compute."** Confirmed at the scale where it matters. We're 2.5-3.1× slower than OxiDD at k=8..11, but the ratio *improves* as k grows: at k=11 we're 2.55×, actually **faster** than the pre-§4.7 HashMap baseline (2.97×) at the same k. The smaller unique table fits L2 better at scale, and that cache-residency win shows up cleanly in the timing. The §4.6 conclusion ("unique-table shrinking is a losing game") was wrong — it was a losing game for the shapes we tried, right for the shape that stores no key at all.
+**"Smaller working set → faster compute."** Confirmed at the scale where it matters, and improving over time. We're 1.75-2.5× slower than OxiDD at k=8..11 on the default build post-§4.12, with the ratio *improving* as k grows: at k=11 we're **1.75×**, the best measurement we've ever recorded. The §4.6 conclusion ("unique-table shrinking is a losing game") was wrong — it was a losing game for the shapes we tried, right for the shape that stores no key at all.
 
 **"Append-only + batch GC is simpler than concurrent refcounting."** True, and the implementation was pleasant. The GC-invalidates-refs model is easy to reason about. Rust's borrow checker gives us the single-writer discipline for free. No locks, no atomics, no TLS.
 
 The overall question — "is this worth pursuing as a real BDD engine?" — depends on what you want.
 
-For a **compute engine racing OxiDD/CUDD on speed alone**: no, but closer than earlier sessions suggested. At k=11 we're 2.55× slower with 2× less memory; if we ever pursued the OxiDD-style partitioned-by-level unique table *on top of* the §4.7 compact layout, the remaining gap would plausibly close further. Not the priority here.
+For a **compute engine racing OxiDD/CUDD on speed alone**: no, but close. At k=11 on the default build we're 1.75× slower with ~half the memory; if we ever pursued the OxiDD-style partitioned-by-level unique table *on top of* the §4.7 compact layout, the remaining gap would plausibly close further. Not the priority here.
 
-For a **memory-constrained engine that can handle bigger DAGs on fixed hardware**: **yes, this is the sharp end of the trade**, and §4.7 doubled down on it. At k=11, vwbdd holds 7.6M live BDD nodes in **~119 MB** total (34 MB arena + 65 MB unique table + 5 MB apply cache + small overhead); OxiDD needs ~244 MB for the same. On a 256 MB memory budget, vwbdd can fit a 2× larger problem before OOM. For FDG reachability sweeps where the working set is the binding constraint, that's meaningful headroom.
+For a **memory-constrained engine that can handle bigger DAGs on fixed hardware**: **yes, this is the sharp end of the trade**. At k=11 on the default build, vwbdd holds 7.6M live BDD nodes in **~121 MB** total (35 MB arena + 84 MB unique table + 2 MB apply cache); OxiDD needs ~244 MB for the same. For deployments where the arena will stay under 4 GiB — wasm clients, browser inference, anything that ships a prepared diagram to a constrained target — the default `Manager<Leb128Codec, u32>` is the right build. For server-side builders that need to absorb tens of GB before serializing, switch to `LargeManager = Manager<Leb128Codec, u64>`: same library, different type alias, no runtime dispatch.
+
+For a **server/client pipeline** (§4.12's key motivation): build with `LargeManager`, serialize the arena as-is (it's already a byte buffer), ship it to a wasm client running `DefaultManager` for inference. The `Leb128Codec` produces the same byte layout at both widths, so the receiving engine just indexes the arena using its own offset type. This wasn't a design goal when the codec was written; it fell out of the variable-width architecture naturally.
 
 For a **compressed storage/transfer format that can also query**: yes. The arena is self-contained, serializable by memcpy, 3.5-4× smaller than dd.autoref's JSON or OxiDD's DDDMP. Querying doesn't require rebuilding a full engine — you can evaluate a BDD on a valuation by walking the compressed arena directly, which is how the FDG paper's downstream consumers would want it.
 
@@ -590,17 +682,19 @@ vwbdd/
 ├── Cargo.toml                   — dev-dep on ../oxidd/crates/oxidd
 ├── VWBDD.md                     — this document
 ├── src/
-│   ├── lib.rs                   — module glue, public re-exports
+│   ├── lib.rs                   — module glue, public re-exports, type aliases (§4.12)
 │   ├── leb.rs                   — unsigned LEB128 u128 encode/decode
-│   ├── node.rs                  — single-node encode/decode: u8 var + LEB128(lo) + LEB128(hi)
-│   ├── unique.rs                — CompactUnique: u32 offsets + u8 hash tags, linear probe (§4.7)
-│   └── manager.rs               — live engine: make_node, ite, and/or/xor/not, gc, apply cache
+│   ├── codec.rs                 — ArenaOffset + NodeCodec traits; Leb128Codec impl (§4.12)
+│   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
+│   ├── unique.rs                — CompactUnique<C, O>: linear-probe, generic slot width (§4.7)
+│   └── manager.rs               — live engine: Manager<C, O>, make_node, ite, and/or/xor/not, gc, apply cache
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
-    ├── node.rs                  — per-node encode/decode
+    ├── node.rs                  — per-node encode/decode (default u32)
     ├── manager.rs               — manager basics, reduction, canonicity, ordering
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
+    ├── large_manager.rs         — LargeManager smoke + u32/u64 cross-width agreement (§4.12)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
     ├── mult.rs                  — x*y=z relation for k=2..8, node count + mem + post-GC accounting
@@ -609,5 +703,5 @@ vwbdd/
     └── timing_large.rs          — large-k sweep, vwbdd vs OxiDD up to 30 s budget (#[ignore]'d; k=8..11)
 ```
 
-Total: 44 tests, all green (#[ignore]'d timing sweeps excluded).
+Total: 49 tests passing, 1 #[ignore]'d timing sweep.
 
