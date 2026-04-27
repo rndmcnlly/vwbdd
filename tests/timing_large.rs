@@ -14,111 +14,13 @@ use std::time::Instant;
 use oxidd::bdd::{new_manager as oxidd_new_manager, BDDFunction};
 use oxidd::{BooleanFunction, Function, Manager as _, ManagerRef};
 
-use vwbdd::{Manager, Ref};
+use vwbdd::Manager;
+
+mod mult_shared;
+use mult_shared::{build_mult, ox_eq, ox_mult, vw_reachable};
 
 // 30 s budget per the user's request.
 const BUDGET_MS: f64 = 30_000.0;
-
-fn vw_vars(vw: &mut Manager, k: u32) -> (Vec<Ref>, Vec<Ref>, Vec<Ref>) {
-    let mk = |vw: &mut Manager| {
-        let v = vw.new_var();
-        let f = vw.r#false();
-        let t = vw.r#true();
-        vw.make_node(v, f, t)
-    };
-    let x: Vec<_> = (0..k).map(|_| mk(vw)).collect();
-    let y: Vec<_> = (0..k).map(|_| mk(vw)).collect();
-    let z: Vec<_> = (0..2 * k).map(|_| mk(vw)).collect();
-    (x, y, z)
-}
-
-fn vw_full_adder(vw: &mut Manager, a: Ref, b: Ref, c: Ref) -> (Ref, Ref) {
-    let ab = vw.xor(a, b);
-    let sum = vw.xor(ab, c);
-    let a_and_b = vw.and(a, b);
-    let c_and_ab = vw.and(c, ab);
-    let carry = vw.or(a_and_b, c_and_ab);
-    (sum, carry)
-}
-fn ox_full_adder(a: &BDDFunction, b: &BDDFunction, c: &BDDFunction) -> (BDDFunction, BDDFunction) {
-    let ab = a.xor(b).unwrap();
-    let sum = ab.xor(c).unwrap();
-    let a_and_b = a.and(b).unwrap();
-    let c_and_ab = c.and(&ab).unwrap();
-    (sum, a_and_b.or(&c_and_ab).unwrap())
-}
-
-fn vw_add(vw: &mut Manager, a: &[Ref], b: &[Ref]) -> Vec<Ref> {
-    let mut out = Vec::with_capacity(a.len());
-    let mut c = vw.r#false();
-    for i in 0..a.len() {
-        let (s, co) = vw_full_adder(vw, a[i], b[i], c);
-        out.push(s); c = co;
-    }
-    out
-}
-fn ox_add(a: &[BDDFunction], b: &[BDDFunction], f: &BDDFunction) -> Vec<BDDFunction> {
-    let mut out = Vec::with_capacity(a.len()); let mut c = f.clone();
-    for i in 0..a.len() {
-        let (s, co) = ox_full_adder(&a[i], &b[i], &c);
-        out.push(s); c = co;
-    }
-    out
-}
-
-fn vw_mult(vw: &mut Manager, x: &[Ref], y: &[Ref]) -> Vec<Ref> {
-    let k = x.len(); let n = 2 * k;
-    let f = vw.r#false();
-    let mut acc: Vec<Ref> = vec![f; n];
-    for j in 0..k {
-        let mut pp: Vec<Ref> = vec![f; n];
-        for i in 0..k { if i + j < n { pp[i + j] = vw.and(x[i], y[j]); } }
-        acc = vw_add(vw, &acc, &pp);
-    }
-    acc
-}
-fn ox_mult(x: &[BDDFunction], y: &[BDDFunction], f: &BDDFunction) -> Vec<BDDFunction> {
-    let k = x.len(); let n = 2 * k;
-    let mut acc: Vec<BDDFunction> = (0..n).map(|_| f.clone()).collect();
-    for j in 0..k {
-        let mut pp: Vec<BDDFunction> = (0..n).map(|_| f.clone()).collect();
-        for i in 0..k { if i + j < n { pp[i + j] = x[i].and(&y[j]).unwrap(); } }
-        acc = ox_add(&acc, &pp, f);
-    }
-    acc
-}
-
-fn vw_eq(vw: &mut Manager, p: &[Ref], z: &[Ref]) -> Ref {
-    let mut acc = vw.r#true();
-    for i in 0..p.len() {
-        let d = vw.xor(p[i], z[i]);
-        let s = vw.not(d);
-        acc = vw.and(acc, s);
-    }
-    acc
-}
-fn ox_eq(p: &[BDDFunction], z: &[BDDFunction], t: &BDDFunction) -> BDDFunction {
-    let mut acc = t.clone();
-    for i in 0..p.len() {
-        let d = p[i].xor(&z[i]).unwrap();
-        let s = d.not().unwrap();
-        acc = acc.and(&s).unwrap();
-    }
-    acc
-}
-
-fn reachable(m: &Manager, r: Ref) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    let mut stk = vec![r];
-    while let Some(r) = stk.pop() {
-        if let Ref::Node(o) = r {
-            if !seen.insert(o) { continue; }
-            let n = m.decode_node(r).unwrap();
-            stk.push(n.lo); stk.push(n.hi);
-        }
-    }
-    seen.len()
-}
 
 struct VwResult {
     dur_ms: f64,
@@ -130,12 +32,9 @@ struct VwResult {
 fn run_vw(k: u32) -> VwResult {
     let t0 = Instant::now();
     let mut vw = Manager::new();
-    let (x, y, z) = vw_vars(&mut vw, k);
-    let p = vw_mult(&mut vw, &x, &y);
-    let r = vw_eq(&mut vw, &p, &z);
-    let nodes = reachable(&vw, r);
-    let remap = vw.gc(&[r]);
-    let _ = remap;
+    let r = build_mult(&mut vw, k);
+    let nodes = vw_reachable(&vw, r);
+    let _ = vw.gc(&[r]);
     let mem = vw.mem_stats();
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     VwResult {
@@ -149,13 +48,15 @@ fn run_vw(k: u32) -> VwResult {
 fn run_ox(k: u32) -> (f64, usize) {
     let t0 = Instant::now();
     // Generous table sizes; mult grows fast.
-    let inner_node_cap = 1 << 24;   // 16M slots max
-    let apply_cache_cap = 1 << 20;  // 1M entries
+    let inner_node_cap = 1 << 24; // 16M slots max
+    let apply_cache_cap = 1 << 20; // 1M entries
     let mref = oxidd_new_manager(inner_node_cap, apply_cache_cap, 1);
     let (x, y, z, tt, ff) = mref.with_manager_exclusive(|mgr| {
-        let names: Vec<String> = (0..k).map(|i| format!("x{}", i))
+        let names: Vec<String> = (0..k)
+            .map(|i| format!("x{}", i))
             .chain((0..k).map(|i| format!("y{}", i)))
-            .chain((0..2 * k).map(|i| format!("z{}", i))).collect();
+            .chain((0..2 * k).map(|i| format!("z{}", i)))
+            .collect();
         mgr.add_named_vars(names.iter().map(|s| s.as_str())).unwrap();
         let x: Vec<_> = (0..k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
         let y: Vec<_> = (k..2 * k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
@@ -164,9 +65,8 @@ fn run_ox(k: u32) -> (f64, usize) {
     });
     let p = ox_mult(&x, &y, &ff);
     let r = ox_eq(&p, &z, &tt);
-    let nc = r.node_count();
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    (dur_ms, nc)
+    (dur_ms, r.node_count())
 }
 
 #[test]
@@ -208,7 +108,8 @@ fn timing_sweep_large() {
             break;
         }
         k += 1;
-        // Hard safety cap.
-        if k > 20 { break; }
+        if k > 20 {
+            break;
+        }
     }
 }

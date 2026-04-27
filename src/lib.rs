@@ -12,6 +12,7 @@
 pub mod leb;
 pub mod manager;
 pub mod node;
+pub mod unique;
 
 pub use manager::{Manager, MemStats};
 pub use node::{Node, Ref};

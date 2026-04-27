@@ -3,205 +3,10 @@
 
 use std::collections::HashMap;
 
-use crate::node::{decode_node_at, decode_var_at, encode_node_at, Node, Ref};
+use crate::node::{decode_node_at, decode_var_at, encode_node_at, ref_to_u64, Node, Ref};
+use crate::unique::{unique_key_hash, CompactUnique};
 
-/// Compact open-addressed unique table. Struct-of-arrays: one `Vec<u32>` of
-/// arena offsets (plus one, so 0 means empty) alongside a parallel `Vec<u8>`
-/// of hash-derived tags. The full key (var, lo, hi) lives in the arena; we
-/// recover it on probe verify via LEB128 decode.
-///
-/// **Why u32 offsets are safe.** Slot values are arena byte offsets, not
-/// node indices. Our arena runs ~4 B/node, so u32 offsets address up to
-/// 4 GB arena = ~900M nodes. Well beyond anything we run today (7.6M nodes
-/// in 34 MB arena at k=11). We assert this bound at insert time. If broken,
-/// switch to u64 slots and accept 2x memory on the table.
-///
-/// **Why u8 hash tags.** A 1-byte tag gives us ~1/256 false-positive rate
-/// per probe, which filters almost all mismatched probes before the
-/// expensive LEB128 decode+compare. This mirrors hashbrown's design without
-/// the SIMD group probe (we probe one slot at a time). Tag 0 is reserved
-/// for empty slots, so live tags are in 1..=255 (lose 1 bit of entropy;
-/// overall false-positive rate is ~1/255).
-///
-/// Combined footprint: 5 B/slot * 1.33 (0.75 load) = **~6.7 B/node**.
-///
-/// Collisions (both hash collisions and probe collisions) resolve by linear
-/// probe: tag mismatch skips decode; tag match triggers verify-on-decode.
-/// No separate overflow bucket needed.
-struct CompactUnique {
-    /// Power-of-two-sized slot array. `slots[i] == 0` means empty; otherwise
-    /// `offset = slots[i] - 1`.
-    slots: Vec<u32>,
-    /// Parallel hash-tag array; same length as `slots`. `tags[i] == 0` when
-    /// `slots[i] == 0`; otherwise `tags[i] = tag_of_hash(hash) != 0`.
-    tags: Vec<u8>,
-    /// Number of live entries (non-zero slots).
-    len: usize,
-    /// When `len` reaches this threshold, resize 2x. Recomputed on resize
-    /// as `new_cap * 3 / 4` (0.75 load factor).
-    resize_at: usize,
-}
-
-/// Derive a nonzero u8 tag from a 64-bit hash.
-#[inline]
-fn tag_of_hash(h: u64) -> u8 {
-    let t = (h >> 56) as u8;
-    t | 1
-}
-
-/// Initial slot count. 1024 slots * 5 B = 5 KB, fits in L1. Grows as needed.
-const COMPACT_UNIQUE_INITIAL_CAP: usize = 1024;
-
-impl CompactUnique {
-    fn new() -> Self {
-        let slots = vec![0u32; COMPACT_UNIQUE_INITIAL_CAP];
-        let tags = vec![0u8; COMPACT_UNIQUE_INITIAL_CAP];
-        Self {
-            slots,
-            tags,
-            len: 0,
-            resize_at: COMPACT_UNIQUE_INITIAL_CAP * 3 / 4,
-        }
-    }
-
-    #[inline]
-    fn cap(&self) -> usize {
-        self.slots.len()
-    }
-
-    #[inline]
-    fn mask(&self) -> usize {
-        self.cap() - 1
-    }
-
-    /// Look up `(var, lo, hi)` by hash. Returns the existing offset on
-    /// match, or `None` if absent (linear probe terminates at empty slot).
-    /// Tag check comes first; decode only on tag match.
-    fn lookup(
-        &self,
-        hash: u64,
-        var: u32,
-        lo: Ref,
-        hi: Ref,
-        buf: &[u8],
-    ) -> Option<u64> {
-        let mask = self.mask();
-        let tag = tag_of_hash(hash);
-        let mut i = (hash as usize) & mask;
-        loop {
-            let t = self.tags[i];
-            if t == 0 {
-                return None;
-            }
-            if t == tag {
-                let slot = self.slots[i];
-                let off = (slot - 1) as u64;
-                let (n, _) = decode_node_at(&buf[off as usize..], off);
-                if n.var == var && n.lo == lo && n.hi == hi {
-                    return Some(off);
-                }
-            }
-            i = (i + 1) & mask;
-        }
-    }
-
-    /// Insert `offset` at the slot determined by `hash`. Caller must have
-    /// verified (via `lookup`) that the key is not already present. Handles
-    /// resize when load factor exceeds 0.75.
-    fn insert(&mut self, hash: u64, offset: u64, buf: &[u8]) {
-        debug_assert!(
-            offset < u32::MAX as u64,
-            "arena exceeded 4 GB; CompactUnique u32 slot overflow"
-        );
-        if self.len + 1 > self.resize_at {
-            self.resize(buf);
-        }
-        let mask = self.mask();
-        let tag = tag_of_hash(hash);
-        let mut i = (hash as usize) & mask;
-        while self.tags[i] != 0 {
-            i = (i + 1) & mask;
-        }
-        self.slots[i] = (offset as u32) + 1;
-        self.tags[i] = tag;
-        self.len += 1;
-    }
-
-    /// Grow to 2x capacity and reinsert every live entry at its new slot.
-    /// We re-hash from the decoded (var, lo, hi) to avoid storing hashes.
-    fn resize(&mut self, buf: &[u8]) {
-        let new_cap = self.cap() * 2;
-        let mut new_slots = vec![0u32; new_cap];
-        let mut new_tags = vec![0u8; new_cap];
-        let new_mask = new_cap - 1;
-        for (i, &slot) in self.slots.iter().enumerate() {
-            if self.tags[i] == 0 {
-                continue;
-            }
-            let off = (slot - 1) as u64;
-            let (n, _) = decode_node_at(&buf[off as usize..], off);
-            let h = unique_key_hash(n.var, n.lo, n.hi);
-            let tag = tag_of_hash(h);
-            let mut j = (h as usize) & new_mask;
-            while new_tags[j] != 0 {
-                j = (j + 1) & new_mask;
-            }
-            new_slots[j] = slot;
-            new_tags[j] = tag;
-        }
-        self.slots = new_slots;
-        self.tags = new_tags;
-        self.resize_at = new_cap * 3 / 4;
-    }
-
-    /// Resize to fit approximately `expected` entries at 0.75 load, rounding
-    /// up to a power of two. Called post-GC to shrink back after construction
-    /// has inflated the table past the live-node footprint.
-    fn resize_for(&mut self, expected: usize) {
-        let needed = ((expected * 4 + 2) / 3).max(COMPACT_UNIQUE_INITIAL_CAP);
-        let mut new_cap = COMPACT_UNIQUE_INITIAL_CAP;
-        while new_cap < needed {
-            new_cap *= 2;
-        }
-        self.slots = vec![0u32; new_cap];
-        self.tags = vec![0u8; new_cap];
-        self.len = 0;
-        self.resize_at = new_cap * 3 / 4;
-    }
-
-    fn bytes(&self) -> usize {
-        self.slots.len() * std::mem::size_of::<u32>()
-            + self.tags.len() * std::mem::size_of::<u8>()
-    }
-}
-
-#[inline]
-fn ref_to_u64(r: Ref) -> u64 {
-    match r {
-        Ref::Terminal(false) => 0x1,
-        Ref::Terminal(true) => 0x2,
-        Ref::Node(o) => 0x1000_0000_0000_0000u64 ^ o,
-    }
-}
-
-/// A fast mixing hash for (var, lo, hi) triples. Uses splitmix64 on the
-/// concatenation of the three pieces. Good enough for unique-table keys;
-/// collisions are resolved by verify-on-decode.
-#[inline]
-fn unique_key_hash(var: u32, lo: Ref, hi: Ref) -> u64 {
-    let mut h = var as u64;
-    h = h.wrapping_mul(0x9e3779b97f4a7c15);
-    h ^= ref_to_u64(lo);
-    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
-    h ^= h >> 27;
-    h ^= ref_to_u64(hi);
-    h = h.wrapping_mul(0x94d049bb133111eb);
-    h ^= h >> 31;
-    h
-}
-
-/// Fast mixing hash for an (f, g, h) ite-cache triple. Same splitmix-style
-/// chain as unique_key_hash but over three Refs.
+/// Fast mixing hash for an (f, g, h) ite-cache triple. Splitmix-style chain.
 #[inline]
 fn ite_key_hash(f: Ref, g: Ref, h: Ref) -> u64 {
     let mut x = ref_to_u64(f);
@@ -352,7 +157,7 @@ impl Manager {
     }
 
     pub fn num_nodes(&self) -> usize {
-        self.unique.len
+        self.unique.len()
     }
 
     pub fn buf_len(&self) -> usize {
@@ -365,28 +170,16 @@ impl Manager {
         &self.buf[off..]
     }
 
-    /// Memory breakdown (arena + unique + cache). The unique-table number
-    /// includes empty slots; at target 0.85 load, slot overhead is ~5.9 B/node.
+    /// Memory breakdown (arena + unique + cache). `unique_bytes` includes
+    /// empty slots; at 0.75 load the linear-probe table runs ~6.7 B/node
+    /// (5 B/slot × 1.33).
     pub fn mem_stats(&self) -> MemStats {
-        // Cuckoo unique table: 20 B/bucket × bucket_count, each bucket
-        // holding at most 4 (offset, tag) pairs.
-        let uniq_entries = self.num_nodes();
-        let uniq_bytes = self.unique.bytes();
-
-        // Direct-mapped ite_cache: fixed-size array of IteCacheEntry
-        // (16 B each, one cache line). Allocated regardless of fill level.
-        let cache_entries = self.ite_cache_len;
-        let cache_bytes = ITE_CACHE_SLOTS * std::mem::size_of::<IteCacheEntry>();
-
-        let var_bytes = 0usize;
-
         MemStats {
             arena_bytes: self.buf.len(),
-            unique_bytes: uniq_bytes,
-            cache_bytes,
-            var_table_bytes: var_bytes,
-            unique_entries: uniq_entries,
-            cache_entries,
+            unique_bytes: self.unique.bytes(),
+            cache_bytes: ITE_CACHE_SLOTS * std::mem::size_of::<IteCacheEntry>(),
+            unique_entries: self.num_nodes(),
+            cache_entries: self.ite_cache_len,
         }
     }
 
@@ -750,14 +543,13 @@ pub struct MemStats {
     pub arena_bytes: usize,
     pub unique_bytes: usize,
     pub cache_bytes: usize,
-    pub var_table_bytes: usize,
     pub unique_entries: usize,
     pub cache_entries: usize,
 }
 
 impl MemStats {
     pub fn total_live(&self) -> usize {
-        self.arena_bytes + self.unique_bytes + self.var_table_bytes
+        self.arena_bytes + self.unique_bytes
     }
     pub fn total_with_cache(&self) -> usize {
         self.total_live() + self.cache_bytes
@@ -767,8 +559,5 @@ impl MemStats {
     }
     pub fn total_bytes_per_node(&self) -> f64 {
         self.total_live() as f64 / self.unique_entries.max(1) as f64
-    }
-    pub fn total_with_cache_per_node(&self) -> f64 {
-        self.total_with_cache() as f64 / self.unique_entries.max(1) as f64
     }
 }

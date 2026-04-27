@@ -62,6 +62,17 @@ pub fn code_to_ref(code: u64, current_offset: u64) -> Ref {
     }
 }
 
+/// Pack a `Ref` into a u64 for hashing. Terminals get small distinct tags;
+/// node offsets get a high bit set so they can't collide with them.
+#[inline]
+pub fn ref_to_u64(r: Ref) -> u64 {
+    match r {
+        Ref::Terminal(false) => 0x1,
+        Ref::Terminal(true) => 0x2,
+        Ref::Node(o) => 0x1000_0000_0000_0000u64 ^ o,
+    }
+}
+
 pub fn encode_node_at(
     var: u32,
     lo: Ref,
