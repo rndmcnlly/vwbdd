@@ -17,13 +17,32 @@ fn node_with_two_terminal_children_roundtrip() {
     );
 }
 
+#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
 #[test]
 fn node_with_terminal_children_packs_small() {
-    // var=0 is 1 LEB byte; children interleave(0, 1) = 2, LEB = 1 byte.
+    // Interleaved: var=0 is 1 LEB byte; children interleave(0, 1) = 2, LEB = 1 byte.
     // Total = 2 bytes.
     let mut buf = Vec::new();
     encode_node_at(0, Ref::Terminal(false), Ref::Terminal(true), 0, &mut buf);
     assert_eq!(buf.len(), 2, "simple variable-x node should be 2 bytes");
+}
+
+#[cfg(feature = "encoding-per-field")]
+#[test]
+fn node_with_terminal_children_packs_small_per_field() {
+    // Per-field: var=0, lo_code=0, hi_code=1 — three 1-byte LEBs.
+    let mut buf = Vec::new();
+    encode_node_at(0, Ref::Terminal(false), Ref::Terminal(true), 0, &mut buf);
+    assert_eq!(buf.len(), 3, "per-field node should be 3 bytes");
+}
+
+#[cfg(feature = "encoding-fixed")]
+#[test]
+fn node_with_terminal_children_packs_small_fixed() {
+    // Fixed: always 12 bytes.
+    let mut buf = Vec::new();
+    encode_node_at(0, Ref::Terminal(false), Ref::Terminal(true), 0, &mut buf);
+    assert_eq!(buf.len(), 12, "fixed node should be 12 bytes");
 }
 
 #[test]

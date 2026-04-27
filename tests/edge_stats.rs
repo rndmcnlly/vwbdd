@@ -1,5 +1,9 @@
 //! Edge distribution statistics for the vwbdd arena.
 //!
+//! Interleaved-encoding-specific: this test reconstructs per-node byte
+//! lengths from the arena by scanning two LEB128 varints. Gated off when a
+//! non-interleaved encoding backend is active.
+//!
 //! Question: in our current relative-only encoding, how are child references
 //! distributed? The 2023 notebook that inspired this design observed a
 //! *bimodal* distribution: children of a node at position ii were usually
@@ -211,6 +215,7 @@ fn analyze(k: u32, stats: &EdgeStats) {
     eprintln!();
 }
 
+#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
 #[test]
 fn edge_distribution_sweep() {
     for k in 2..=8u32 {

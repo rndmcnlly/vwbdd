@@ -11,6 +11,8 @@ pub mod leb;
 pub mod manager;
 pub mod node;
 pub mod pair;
+pub mod profile;
 
 pub use manager::{Manager, MemStats};
 pub use node::{Node, Ref};
+pub use node::ENCODING_NAME;

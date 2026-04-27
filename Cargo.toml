@@ -6,6 +6,18 @@ edition = "2021"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Default is the historical §4.2 interleaved LEB128 encoding.
+default = []
+# Mutually exclusive alternative encodings (see src/node.rs).
+encoding-interleaved = []
+encoding-per-field = []
+encoding-fixed = []
+# When set, Manager accumulates per-phase timing counters (decode / var_of /
+# unique-table work / encode / cache) and prints a breakdown from mem_stats-
+# adjacent APIs. Off by default so the hot path stays clean.
+profile-timing = []
+
 [dependencies]
 
 [dev-dependencies]

@@ -128,6 +128,7 @@ struct VwResult {
 }
 
 fn run_vw(k: u32) -> VwResult {
+    vwbdd::profile::reset();
     let t0 = Instant::now();
     let mut vw = Manager::new();
     let (x, y, z) = vw_vars(&mut vw, k);
@@ -138,6 +139,8 @@ fn run_vw(k: u32) -> VwResult {
     let _ = remap;
     let mem = vw.mem_stats();
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let snap = vwbdd::profile::snapshot();
+    snap.report(&format!("k={} ({})", k, vwbdd::ENCODING_NAME), Some(dur_ms));
     VwResult {
         dur_ms,
         nodes,
@@ -172,6 +175,7 @@ fn run_ox(k: u32) -> (f64, usize) {
 #[test]
 #[ignore] // expensive; run with `cargo test --release --test timing_large -- --ignored --nocapture`
 fn timing_sweep_large() {
+    eprintln!("# encoding: {}", vwbdd::ENCODING_NAME);
     eprintln!(
         "{:>3} {:>11} {:>12} {:>12} {:>6}  {:>8} {:>10}",
         "k", "nodes", "vwbdd (ms)", "oxidd (ms)", "ratio", "arena B/n", "total B/n"

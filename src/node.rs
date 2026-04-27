@@ -1,24 +1,31 @@
-//! Variable-width node encoding.
+//! Node encoding backends.
 //!
-//! Each node is two LEB128 varints:
+//! Three mutually exclusive encodings of `(var, lo, hi)` into the arena byte
+//! buffer are selectable via Cargo features:
 //!
-//!   LEB128(var)
-//!   LEB128(interleave(lo_code, hi_code))    as u128
+//! - `encoding-interleaved` (default): LEB128(var); LEB128(interleave(lo_code, hi_code)).
+//!   The historical §4.2 layout. ~4.6 B/node at k=11.
 //!
-//! Child reference encoding (u64):
+//! - `encoding-per-field`: LEB128(var); LEB128(lo_code); LEB128(hi_code).
+//!   Drops the interleave/deinterleave; three independent varints.
+//!   Trades a small byte-count loss for a simpler decode.
+//!
+//! - `encoding-fixed`: repr-C struct of [u32; 3] = (var, lo_packed, hi_packed).
+//!   Fixed 12 B/node, no varint decode. Ceiling comparison: tells us how much
+//!   of our time the variable-width decode is actually costing.
+//!
+//! Child reference encoding (`ref_to_code`/`code_to_ref`):
 //!   0                 -> false terminal
 //!   1                 -> true terminal
 //!   2 + delta         -> node at (current_node_offset - delta)
 //!
-//! Rationale: we tried a compressed form that stored v_skip instead of var
-//! (var could be reconstructed from children's vars). That saved ~0.5-1 byte
-//! per node but forced decode to look up each child's var in a side HashMap,
-//! costing ~10 ns/lookup × 2 = ~20 ns per decode on top of the ~20 ns of
-//! LEB128/pairing work. By storing var inline, decode needs no side table
-//! at all: ~25 ns total, 2-3x faster. Worth the bytes.
-
-use crate::leb::{decode_u128, encode_u128};
-use crate::pair::{deinterleave, interleave};
+//! All backends expose the same API:
+//!   encode_node_at(var, lo, hi, current_offset, out)
+//!   decode_node_at(buf, current_offset) -> (Node, bytes_consumed)
+//!   decode_var_at(buf, current_offset)  -> (var, bytes_consumed_if_only_var)
+//!
+//! The last is a fast path for `var_of` which is called twice per `make_node`
+//! (ordering assertion) and once per `cofactor` / `top_var`.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ref {
@@ -57,26 +64,27 @@ pub fn code_to_ref(code: u64, current_offset: u64) -> Ref {
     }
 }
 
-pub fn encode_node_at(
-    var: u32,
-    lo: Ref,
-    hi: Ref,
-    current_offset: u64,
-    out: &mut Vec<u8>,
-) {
-    debug_assert_eq!(out.len() as u64, current_offset);
-    encode_u128(var as u128, out);
-    let lo_code = ref_to_code(lo, current_offset);
-    let hi_code = ref_to_code(hi, current_offset);
-    let children = interleave(lo_code, hi_code);
-    encode_u128(children, out);
-}
+// ---- Feature dispatch -------------------------------------------------------
 
-pub fn decode_node_at(buf: &[u8], current_offset: u64) -> (Node, usize) {
-    let (var, n0) = decode_u128(&buf[..]);
-    let (packed, n1) = decode_u128(&buf[n0..]);
-    let (lo_code, hi_code) = deinterleave(packed);
-    let lo = code_to_ref(lo_code, current_offset);
-    let hi = code_to_ref(hi_code, current_offset);
-    (Node { var: var as u32, lo, hi }, n0 + n1)
-}
+#[cfg(all(feature = "encoding-per-field", feature = "encoding-interleaved"))]
+compile_error!("encoding-per-field and encoding-interleaved are mutually exclusive");
+#[cfg(all(feature = "encoding-fixed", feature = "encoding-interleaved"))]
+compile_error!("encoding-fixed and encoding-interleaved are mutually exclusive");
+#[cfg(all(feature = "encoding-fixed", feature = "encoding-per-field"))]
+compile_error!("encoding-fixed and encoding-per-field are mutually exclusive");
+
+// Default: interleaved (the §4.2 historical baseline).
+#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
+mod interleaved;
+#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
+pub use interleaved::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
+
+#[cfg(feature = "encoding-per-field")]
+mod per_field;
+#[cfg(feature = "encoding-per-field")]
+pub use per_field::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
+
+#[cfg(feature = "encoding-fixed")]
+mod fixed;
+#[cfg(feature = "encoding-fixed")]
+pub use fixed::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
