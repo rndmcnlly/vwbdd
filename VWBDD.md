@@ -625,6 +625,77 @@ For the `LargeManager` (u64) configuration, timing stays close to §4.11's numbe
 **What this doesn't yet give us.** Codec parameterization is scaffolded but not exercised. The next session that wants to revisit §4.10's codec A/B can add an `InterleavedCodec` and slot it into the same `Manager<InterleavedCodec, u32>` shape; no further `Manager` changes needed. Until then, `Leb128Codec` is the only codec shipped, and the trait's presence is mostly pedagogical — a clean boundary that says "this is the thing that changes when you experiment with node layouts."
 
 
+### 4.13 The apply cache was a silent perf trap
+
+Until this session, the direct-mapped apply cache was hardcoded at 2^17 slots — 128k entries, 2 MiB. That choice came from §4.5 when our largest benchmark was k=8 mult (122k nodes), and it was correct for that regime. It was never re-examined as the project pushed through k=11 and k=12.
+
+A three-way comparison (vwbdd native, oxidd native, oxidd-wasm via the `iota` demo at rndmcnlly.github.io/oxidd-wasm/iota.html) exposed the trap. iota's published numbers for a truncated `(x*y) mod 2^k = z` workload had us 6.97× slower than oxidd at k=15 — anomalously bad relative to our stable ~2.5× ratio at k ≤ 12. The diagnosis: at k=15 the working set is ~10M edges; with 128k cache slots that's 80× oversubscription. Every `ite` recursion was evicting entries it would need seconds later, turning memoization into a cache-miss storm.
+
+The fix was a one-line change and a 2.66× speedup at k=15. Bumping the cache to 2^21 slots (2M entries, 32 MiB) brought the ratio back to 2.60×, flat with k=12, 13, 14. Direct measurement:
+
+| k | nodes | vwbdd old (2^17 cache) | vwbdd new (2^21 cache) | oxidd (2^25 cache) | old ratio | new ratio |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 464,181 | 314 ms | ≈ same | 121 ms | 2.60× | 2.60× |
+| 13 | 1,292,158 | 951 ms | ≈ same | 386 ms | 2.47× | 2.47× |
+| 14 | 3,697,095 | 3,564 ms | ≈ same | 1,275 ms | 2.80× | 2.80× |
+| **15** | **10,304,528** | **31,375 ms** | **11,812 ms** | **4,693 ms** | **6.97×** | **2.51×** |
+
+**How oxidd sizes its stuff** (answering the question that motivated this section):
+
+The library (`oxidd::bdd::new_manager`) takes two capacities explicitly: `inner_node_capacity` and `apply_cache_capacity`, plus a `threads` count. No defaults inside the library. The `oxidd-cli` reference tool picks:
+
+- **Apply cache**: **32 Mi entries (2^25)** by default — the canonical "large fixed absolute allocation" (~1.3 GB at ~40 B/entry). Hardcoded, not scaled to problem size.
+- **Inner node table**: fills remaining RAM at 32 B/slot, capped at 2^32 entries (32-bit edge index).
+
+Entry sizes:
+- oxidd's direct-mapped cache: parking_lot mutex + arity byte + numeric byte + operator + 3 edges + value ≈ **40 B/entry** (supports up to arity-3 for ite-style operators).
+- vwbdd's: `4 × PackedRef<u32>` = **16 B/entry** at u32, **32 B/entry** at u64. No mutex (single-threaded by `&mut self`), no arity variability, tuned specifically for ite.
+
+At matched entry count, vwbdd's cache uses 40% of oxidd's memory for the same slot coverage. Our new 2^21 default (32 MiB) gives us 2M slots — roughly equivalent cache coverage to oxidd at 820k entries (33 MB), which oxidd-cli considers undersized by default. The real lesson: **the default should have been 2^21 since §4.5**, and we paid for not re-examining it for six months of workload growth.
+
+**API shape** (`src/manager.rs`):
+
+```rust
+pub struct ManagerConfig { ite_cache_slots: usize }
+
+impl ManagerConfig {
+    pub const fn new() -> Self { /* 2^21 default */ }
+    #[must_use]
+    pub const fn with_cache_slots(self, slots: usize) -> Self { /* power-of-two check */ }
+}
+
+impl Manager<C, O> {
+    pub fn with_config(config: ManagerConfig) -> Self { ... }
+}
+
+impl Manager<Leb128Codec, u32> {      // the default-type inherent impl
+    pub fn new() -> Self { Self::with_config(ManagerConfig::default()) }
+    pub fn with_cache_slots(slots: usize) -> Self { /* convenience */ }
+}
+```
+
+This mirrors `Vec::new` vs `Vec::with_capacity` (stdlib) and oxidd's "caller picks" philosophy, while giving a sensible default so `Manager::new()` does the right thing for the common case.
+
+**Why a builder struct over a single `new(slots)` function**: forward compatibility. Future knobs — per-level unique-table partitioning (§5 TODO), GC-trigger heuristics, custom initial arena capacity — can land as more `with_*` methods without breaking existing call sites. We don't need any of those today; we just don't want to paint ourselves into a corner on the one-knob API.
+
+**What's left exposed.** The new default (2^21) is still 16× smaller than oxidd-cli's (2^25). On a laptop with 64 GB of RAM that difference is meaningless; the 32 MB we allocate now vs 512 MB oxidd allocates is both statistically zero. But the caller who wants the full oxidd-cli-scale treatment can now name it: `Manager::with_cache_slots(1 << 25)`. Tests can sweep the space and find an optimum per workload without recompiling.
+
+**Measured steady-state ratio, k=12..15, on the truncated mult relation** (matches iota's workload):
+
+| k | nodes | vwbdd (ms) | oxidd native (ms) | iota wasm (ms) | vwbdd/oxidd | vwbdd/iota |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 464k | 314 | 121 | 158 | 2.60× | 1.99× |
+| 13 | 1.3M | 951 | 386 | 505 | 2.47× | 1.88× |
+| 14 | 3.7M | 3,564 | 1,275 | 1,632 | 2.80× | 2.18× |
+| 15 | 10.3M | 11,812 | 4,693 | 5,329 | **2.51×** | **2.22×** |
+
+The ratio is flat at 2.5-2.8× across a 22× growth in node count. That's the real answer to "how does vwbdd compare at scale": not 6.97× as the unfixed cache suggested, not 1.75× as the §4.12 writeup claimed (that number was on the *full* 2k-bit relation with different variable ordering characteristics). On this specific iota-style workload, steady state is ~2.6× slower than oxidd native, ~2.1× slower than oxidd-wasm in a browser.
+
+**Reconciling with §4.12's numbers.** The full-relation k=11 landing at 1.75× and the truncated k=15 landing at 2.51× aren't inconsistent — they're measuring different functions. The full 2k-bit relation with 44 variables produces BDDs whose internal structure happens to be friendlier to our variable-width codec (more locality → more 1-byte LEB128 deltas). The truncated relation with 3k=45 variables produces denser interconnect (k-bit product crossing through a k-bit equality) where the byte-per-edge advantage shrinks. Both are real; neither is the full story. The honest framing is "2-3× slower than oxidd, with the constant depending on workload graph structure."
+
+**What the ratio would look like if we matched oxidd's cache entry size.** If we went from 16 B PackedRef entries to 40 B full-key entries (no verify-on-decode), we'd stop paying `decode_node_at` on every cache miss verification, and our 2M-slot cache would functionally behave like oxidd's. But the memory footprint would grow from 32 MB to 80 MB, and we'd lose the architectural parity with §4.7's "don't store the key" insight. A future session could explore this as an A/B but it's not obviously a win.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -637,7 +708,7 @@ Things we'd want before calling this a real engine:
 
 **Codec A/B harness.** §4.12 scaffolded the `NodeCodec<O>` trait but only materialized `Leb128Codec`. A future session revisiting §4.10 can add `InterleavedCodec`, `Fixed12Codec`, or `VSkipCodec` as type-parameter variants and run them head-to-head in a single test binary — no `Manager` changes needed. The path-dependent reason to skip this now is that §4.10's A/B already ruled those three out on the mult workload; the path-independent reason to do it later is a workload with different edge statistics (ROM data, §4.4's inspiration) might flip the answer.
 
-**Tunable / adaptive apply-cache size.** The fixed 2^17-slot direct-mapped cache (§4.5, §4.8) is undersized at k ≥ 10 on mult (see §3.4's k=10 ratio peak). Default build: 2 MB cache; LargeManager: 4 MB. Doubling or quadrupling the slot count is still trivial against a TB-scale arena budget. `Manager::new_with_cache_size(n)` plus a sensible growth heuristic would flip the k=10 regime. Low risk, high payoff at large k.
+**Adaptive apply-cache size.** §4.13 made the cache tunable at construction time and bumped the default to 2^21 slots. Not yet adaptive: the cache doesn't grow in response to workload pressure, and there's no heuristic connecting problem size (number of declared vars, `make_node` rate) to the right slot count. oxidd-cli's approach is "allocate big, 2^25 slots by default" and it works because they have a generous `inner_node_capacity` budget anyway. A workload-aware heuristic would be a real improvement over either fixed default, especially for a wasm target that can't afford the 32 MB baseline.
 
 **Decoded-node cache.** For very hot nodes (usually the ones near the roots of the current operation), cache the decoded `(var, lo, hi)` in a small fixed-width table to skip repeated LEB128 work. Not yet attempted.
 
@@ -687,21 +758,24 @@ vwbdd/
 │   ├── codec.rs                 — ArenaOffset + NodeCodec traits; Leb128Codec impl (§4.12)
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
 │   ├── unique.rs                — CompactUnique<C, O>: linear-probe, generic slot width (§4.7)
-│   └── manager.rs               — live engine: Manager<C, O>, make_node, ite, and/or/xor/not, gc, apply cache
+│   └── manager.rs               — live engine: Manager<C, O>, ManagerConfig, make_node, ite, and/or/xor/not, gc, apply cache (§4.13)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
     ├── node.rs                  — per-node encode/decode (default u32)
     ├── manager.rs               — manager basics, reduction, canonicity, ordering
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
+    ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
     ├── large_manager.rs         — LargeManager smoke + u32/u64 cross-width agreement (§4.12)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
-    ├── mult.rs                  — x*y=z relation for k=2..8, node count + mem + post-GC accounting
-    ├── mult_shared/mod.rs       — shared vwbdd+OxiDD ripple-adder mult builders, reused by timing.rs, timing_large.rs, mult.rs
-    ├── timing.rs                — wall-clock comparison vs OxiDD on mult (k=4..8)
-    └── timing_large.rs          — large-k sweep, vwbdd vs OxiDD up to 30 s budget (#[ignore]'d; k=8..11)
+    ├── mult.rs                  — full x*y=z relation for k=2..8, node count + mem + post-GC accounting
+    ├── mult_shared/mod.rs       — shared vwbdd+OxiDD builders: full-relation (2k-bit z) and truncated (k-bit z) variants
+    ├── mult_trunc_correctness.rs— truncated (iota-style) node counts at small k (§4.13)
+    ├── mult_trunc_timing.rs     — truncated mult vs OxiDD, matched to iota's demo workload (§4.13; #[ignore]'d)
+    ├── timing.rs                — wall-clock comparison vs OxiDD on full mult (k=4..8)
+    └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
 ```
 
-Total: 49 tests passing, 1 #[ignore]'d timing sweep.
+Total: 57 tests passing, 2 #[ignore]'d timing sweeps.
 

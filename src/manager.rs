@@ -105,12 +105,67 @@ impl<O: ArenaOffset> IteCacheEntry<O> {
     }
 }
 
-/// Power-of-two number of slots. 2^17 = 131,072 entries.
-/// - u32: 2 MiB cache
-/// - u64: 4 MiB cache
-/// Large enough to hold most of k=8's mult working set with low collision eviction.
-const ITE_CACHE_SLOTS: usize = 1 << 17;
-const ITE_CACHE_MASK: u64 = (ITE_CACHE_SLOTS as u64) - 1;
+/// Default number of slots in the direct-mapped ite apply cache.
+/// 2^21 = 2,097,152 entries:
+/// - u32: 32 MiB cache
+/// - u64: 64 MiB cache
+///
+/// Chosen to clear the k=15 truncated-mult working set (~10M edges) while
+/// staying trivial relative to any real workload's RAM budget. The earlier
+/// 2^17 default (§4.5, §4.8) turned out to be a silent perf trap once
+/// workloads grew past k=11: throughput fell 2-3× when the working set
+/// overflowed the cache. Override via [`ManagerConfig::with_cache_slots`]
+/// for small-arena workloads where the default's 32 MiB is wasteful.
+pub const DEFAULT_ITE_CACHE_SLOTS: usize = 1 << 21;
+
+/// Construction-time options for [`Manager`]. Builder-shaped so that future
+/// knobs (per-level unique-table partitioning, GC-trigger heuristics, etc.)
+/// can be added without breaking existing call sites.
+///
+/// Mirrors oxidd's approach: the library doesn't guess — the caller names
+/// the capacities explicitly, but a `default()` gives a sensible baseline.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagerConfig {
+    ite_cache_slots: usize,
+}
+
+impl ManagerConfig {
+    /// Default config: [`DEFAULT_ITE_CACHE_SLOTS`] entries in the apply cache.
+    pub const fn new() -> Self {
+        Self {
+            ite_cache_slots: DEFAULT_ITE_CACHE_SLOTS,
+        }
+    }
+
+    /// Set the direct-mapped ite apply cache size in slots. Must be a
+    /// power of two so the probe can use `hash & (slots - 1)` instead of
+    /// a modulo. Panics otherwise.
+    ///
+    /// Typical values: `1 << 17` (128k, 2 MiB) for tight-memory builds;
+    /// `1 << 21` (2M, 32 MiB, the default); `1 << 25` (32M, 512 MiB) for
+    /// oxidd-cli-scale workloads.
+    #[must_use]
+    pub const fn with_cache_slots(mut self, slots: usize) -> Self {
+        assert!(
+            slots.is_power_of_two(),
+            "ite_cache_slots must be a power of two"
+        );
+        assert!(slots >= 2, "ite_cache_slots must be at least 2");
+        self.ite_cache_slots = slots;
+        self
+    }
+
+    /// Current cache-slot count.
+    pub const fn ite_cache_slots(self) -> usize {
+        self.ite_cache_slots
+    }
+}
+
+impl Default for ManagerConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The live BDD engine.
 ///
@@ -124,28 +179,36 @@ pub struct Manager<C: NodeCodec<O> = Leb128Codec, O: ArenaOffset = u32> {
     /// 0.75 load factor on power-of-two sizes (§4.7, §4.11).
     unique: CompactUnique<C, O>,
     num_vars: u32,
-    /// Direct-mapped ite apply cache. Fixed-size; collisions evict.
-    ite_cache: Box<[IteCacheEntry<O>; ITE_CACHE_SLOTS]>,
+    /// Direct-mapped ite apply cache. Fixed-size (set at construction);
+    /// collisions evict. See [`ManagerConfig::with_cache_slots`].
+    ite_cache: Box<[IteCacheEntry<O>]>,
+    /// `ite_cache.len() - 1`, precomputed for the `hash & mask` fast path.
+    /// Since `ite_cache.len()` is always a power of two (enforced by
+    /// [`ManagerConfig::with_cache_slots`]), this mask gives the slot index.
+    ite_cache_mask: u64,
     /// Live entry count (for diagnostics; approximate under eviction).
     ite_cache_len: usize,
     _codec: PhantomData<C>,
 }
 
 impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
-    /// Construct an empty manager. Prefer the `Default` impl or a specific
-    /// type alias (`DefaultManager`, `LargeManager`) for ergonomic
-    /// type inference.
-    pub fn new_parameterized() -> Self {
-        // Box::new on a huge array would overflow the stack; build on heap.
-        let entries: Vec<IteCacheEntry<O>> = vec![IteCacheEntry::empty(); ITE_CACHE_SLOTS];
-        let boxed_slice: Box<[IteCacheEntry<O>]> = entries.into_boxed_slice();
-        let ite_cache: Box<[IteCacheEntry<O>; ITE_CACHE_SLOTS]> =
-            boxed_slice.try_into().ok().expect("ite_cache size matches");
+    /// Construct a manager with explicit config. The generic-accepting path;
+    /// callers using the default type parameters can use the inherent
+    /// `Manager::new()` or `Manager::with_cache_slots(n)`.
+    pub fn with_config(config: ManagerConfig) -> Self {
+        let slots = config.ite_cache_slots;
+        debug_assert!(slots.is_power_of_two());
+        debug_assert!(slots >= 2);
+        // vec! + into_boxed_slice keeps the heap allocation contiguous
+        // without ever building the huge array on the stack.
+        let ite_cache: Box<[IteCacheEntry<O>]> =
+            vec![IteCacheEntry::empty(); slots].into_boxed_slice();
         Self {
             buf: Vec::new(),
             unique: CompactUnique::new(),
             num_vars: 0,
             ite_cache,
+            ite_cache_mask: (slots as u64) - 1,
             ite_cache_len: 0,
             _codec: PhantomData,
         }
@@ -189,12 +252,13 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
 
     /// Memory breakdown (arena + unique + cache). `unique_bytes` includes
     /// empty slots; at 0.75 load the linear-probe table runs ~(1.33 × slot_width)
-    /// bytes per node.
+    /// bytes per node. `cache_bytes` reflects the cache size chosen at
+    /// construction via [`ManagerConfig`].
     pub fn mem_stats(&self) -> MemStats {
         MemStats {
             arena_bytes: self.buf.len(),
             unique_bytes: self.unique.bytes(),
-            cache_bytes: ITE_CACHE_SLOTS * std::mem::size_of::<IteCacheEntry<O>>(),
+            cache_bytes: self.ite_cache.len() * std::mem::size_of::<IteCacheEntry<O>>(),
             unique_entries: self.num_nodes(),
             cache_entries: self.ite_cache_len,
         }
@@ -305,7 +369,7 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
     /// empty slot or collision miss.
     #[inline]
     fn ite_cache_get(&self, f: Ref<O>, g: Ref<O>, h: Ref<O>) -> Option<Ref<O>> {
-        let slot = (ite_key_hash::<O>(f, g, h) & ITE_CACHE_MASK) as usize;
+        let slot = (ite_key_hash::<O>(f, g, h) & self.ite_cache_mask) as usize;
         let e = &self.ite_cache[slot];
         let pf = PackedRef::<O>::pack(f);
         if e.f == pf && e.g == PackedRef::<O>::pack(g) && e.h == PackedRef::<O>::pack(h) {
@@ -318,7 +382,7 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
     /// Insert into the direct-mapped apply cache. Overwrites on collision.
     #[inline]
     fn ite_cache_put(&mut self, f: Ref<O>, g: Ref<O>, h: Ref<O>, r: Ref<O>) {
-        let slot = (ite_key_hash::<O>(f, g, h) & ITE_CACHE_MASK) as usize;
+        let slot = (ite_key_hash::<O>(f, g, h) & self.ite_cache_mask) as usize;
         let e = &mut self.ite_cache[slot];
         if e.f == PackedRef::<O>::empty() {
             self.ite_cache_len += 1;
@@ -528,21 +592,34 @@ fn translate<O: ArenaOffset>(remap: &HashMap<u64, Ref<O>>, r: Ref<O>) -> Ref<O> 
 
 impl<C: NodeCodec<O>, O: ArenaOffset> Default for Manager<C, O> {
     fn default() -> Self {
-        Self::new_parameterized()
+        Self::with_config(ManagerConfig::default())
     }
 }
 
-/// Convenience: `Manager::new()` returns the default compact (u32, Leb128)
-/// engine. This is deliberately a concrete-type method rather than a generic
-/// one, so tests can write `Manager::new()` and have inference pick the
-/// defaults. For other configurations use a type alias plus `::default()`:
+/// Convenience inherent impls on the default (u32, Leb128) type so callers
+/// can write `Manager::new()` and `Manager::with_cache_slots(n)` without
+/// turbofish. Type inference picks these over the generic `with_config`
+/// path. For other configurations use a type alias plus
+/// `::with_config(...)` or `::default()`:
 ///
 /// ```ignore
 /// let m: LargeManager = LargeManager::default();
+/// let m: LargeManager = LargeManager::with_config(
+///     ManagerConfig::default().with_cache_slots(1 << 20)
+/// );
 /// ```
 impl Manager<Leb128Codec, u32> {
+    /// Default-config manager: compact u32 arena, Leb128 codec, 2^21-slot
+    /// apply cache.
     pub fn new() -> Self {
-        Self::new_parameterized()
+        Self::with_config(ManagerConfig::default())
+    }
+
+    /// Convenience: build a default-width engine with an overridden apply
+    /// cache slot count. Equivalent to
+    /// `Self::with_config(ManagerConfig::new().with_cache_slots(slots))`.
+    pub fn with_cache_slots(slots: usize) -> Self {
+        Self::with_config(ManagerConfig::new().with_cache_slots(slots))
     }
 }
 

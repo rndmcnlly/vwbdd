@@ -1,13 +1,15 @@
-//! Larger-k timing sweep. Starts at k=8 and walks up until vwbdd crosses a
-//! wall-clock budget. Also tracks arena B/node, unique table size, and the
-//! vwbdd/oxidd ratio to see whether the ratio is stable, improving, or
-//! degrading with scale.
+//! Truncated mult-relation timing, matching iota's demo.
 //!
-//! Runs both engines on each k but in separate threads with large stacks
-//! (OxiDD's internal apply recurses deeply).
+//! iota (oxidd-wasm) reports in-browser timings for `(x*y) mod 2^k = z`
+//! where x, y, z are all k bits wide. This differs from the `tests/timing*`
+//! harnesses, which build the full 2k-bit relation `x*y=z` with z stretched
+//! to 2k bits. The truncated function is drastically smaller (discards the
+//! high k bits of the product), so the same k values produce ~1-2 orders
+//! of magnitude fewer nodes than the full-precision tests.
 //!
-//! Stopping rule: after a k whose vwbdd wall-clock exceeds BUDGET_MS we
-//! don't attempt the next k.
+//! This file exists so the vwbdd vs. oxidd-wasm vs. oxidd-native
+//! comparison for the truncated workload is apples-to-apples.
+//! `#[ignore]`d by default: run with `--ignored --nocapture`.
 
 use std::time::Instant;
 
@@ -17,10 +19,8 @@ use oxidd::{BooleanFunction, Function, Manager as _, ManagerRef};
 use vwbdd::Manager;
 
 mod mult_shared;
-use mult_shared::{build_mult, ox_eq, ox_mult, vw_reachable};
+use mult_shared::{build_mult_trunc, ox_eq, ox_mult_trunc, vw_reachable};
 
-// 10 min budget; k=11 is ~32 s on the default build, so k=12 is
-// likely 2-3 min. Bump when pushing the sweep further.
 const BUDGET_MS: f64 = 600_000.0;
 
 struct VwResult {
@@ -33,7 +33,7 @@ struct VwResult {
 fn run_vw(k: u32) -> VwResult {
     let t0 = Instant::now();
     let mut vw = Manager::new();
-    let r = build_mult(&mut vw, k);
+    let r = build_mult_trunc(&mut vw, k);
     let nodes = vw_reachable(&vw, r);
     let _ = vw.gc(&[r]);
     let mem = vw.mem_stats();
@@ -48,43 +48,47 @@ fn run_vw(k: u32) -> VwResult {
 
 fn run_ox(k: u32) -> (f64, usize) {
     let t0 = Instant::now();
-    // Match oxidd-cli's default: 32 Mi apply-cache entries (~1.3 GB).
-    // Lets oxidd run at its own preferred config.
-    let inner_node_cap = 1 << 27; // 128M slots max (k=12 needs ~30M)
+    // Match oxidd-cli's default: 32 Mi apply-cache entries (~1.3 GB),
+    // inner node capacity big enough for the truncated k=17 target
+    // (~80M nodes). This lets each engine run at its own preferred
+    // config rather than being handicapped by a too-small cache.
+    let inner_node_cap = 1 << 27; // 128M slots
     let apply_cache_cap = 32 * 1024 * 1024; // oxidd-cli's default
     let mref = oxidd_new_manager(inner_node_cap, apply_cache_cap, 1);
-    let mref = oxidd_new_manager(inner_node_cap, apply_cache_cap, 1);
     let (x, y, z, tt, ff) = mref.with_manager_exclusive(|mgr| {
+        // Three k-bit uints, same declaration order as iota: x, y, z.
         let names: Vec<String> = (0..k)
             .map(|i| format!("x{}", i))
             .chain((0..k).map(|i| format!("y{}", i)))
-            .chain((0..2 * k).map(|i| format!("z{}", i)))
+            .chain((0..k).map(|i| format!("z{}", i)))
             .collect();
         mgr.add_named_vars(names.iter().map(|s| s.as_str())).unwrap();
         let x: Vec<_> = (0..k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
         let y: Vec<_> = (k..2 * k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
-        let z: Vec<_> = (2 * k..4 * k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
+        let z: Vec<_> = (2 * k..3 * k).map(|i| BDDFunction::var(mgr, i).unwrap()).collect();
         (x, y, z, BDDFunction::t(mgr), BDDFunction::f(mgr))
     });
-    let p = ox_mult(&x, &y, &ff);
+    let p = ox_mult_trunc(&x, &y, &ff);
     let r = ox_eq(&p, &z, &tt);
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     (dur_ms, r.node_count())
 }
 
 #[test]
-#[ignore] // expensive; run with `cargo test --release --test timing_large -- --ignored --nocapture`
-fn timing_sweep_large() {
+#[ignore] // expensive; run with `--ignored --nocapture`
+fn mult_trunc_sweep() {
+    eprintln!("Truncated mult relation: (x*y) mod 2^k = z (matches iota)");
     eprintln!(
         "{:>3} {:>11} {:>12} {:>12} {:>6}  {:>8} {:>10}",
         "k", "nodes", "vwbdd (ms)", "oxidd (ms)", "ratio", "arena B/n", "total B/n"
     );
 
-    let mut k: u32 = 8;
-    loop {
-        // Each run in its own thread with huge stack — OxiDD recurses deeply.
+    // Smoke sweep: small k only. Bump the list when scaling further.
+    let ks: &[u32] = &[15];
+
+    for &k in ks {
         let handle = std::thread::Builder::new()
-            .stack_size(1024 << 20) // 1 GiB
+            .stack_size(1024 << 20)
             .spawn(move || {
                 let vw = run_vw(k);
                 let (ox_ms, ox_nodes) = run_ox(k);
@@ -93,6 +97,7 @@ fn timing_sweep_large() {
             .unwrap();
         let (vw, ox_ms, ox_nodes) = handle.join().unwrap();
 
+        // Terminals convention: vwbdd excludes, oxidd includes; +2.
         assert_eq!(
             vw.nodes + 2, ox_nodes,
             "node count mismatch at k={}: vwbdd={} oxidd={}",
@@ -108,10 +113,6 @@ fn timing_sweep_large() {
 
         if vw.dur_ms > BUDGET_MS {
             eprintln!("(stopping: vwbdd k={} exceeded {:.0}s budget)", k, BUDGET_MS / 1000.0);
-            break;
-        }
-        k += 1;
-        if k > 20 {
             break;
         }
     }
