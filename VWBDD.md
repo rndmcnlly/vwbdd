@@ -28,9 +28,9 @@ Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addre
 
 ## 1. Motivation
 
-Modern BDD engines (OxiDD, CUDD, Sylvan, BuDDy) all use fixed-width 16-byte nodes in flat arrays. At k=10 mult-relation, that's ~200 MiB just for the nodes. The laptop cache hierarchy makes working-set size a first-order perf variable: an L2-resident BDD runs 2-3× faster per op than a DRAM-resident one (see the roofline analysis in the parent repo's session notes).
+Modern BDD engines (OxiDD, CUDD, Sylvan, BuDDy) all use fixed-width 16-byte nodes in flat arrays. At k=10 mult-relation, that's ~200 MiB just for the nodes. The laptop cache hierarchy makes working-set size a first-order perf variable: an L2-resident BDD runs 2-3× faster per op than a DRAM-resident one.
 
-A 2023 notebook experiment (`CompressWithBDDs.ipynb` in the parent dir) showed that BDDs can be **serialized** at ~3 bytes/node using LEB128 + pairing-function packing, a ~5× size reduction. That codec was offline: the author built the BDD in `dd.autoref`, then walked it to emit a compressed byte stream.
+A 2023 notebook experiment showed that BDDs can be **serialized** at ~3 bytes/node using LEB128 + pairing-function packing, a ~5× size reduction. That codec was offline: the author built the BDD in `dd.autoref`, then walked it to emit a compressed byte stream.
 
 The question that wouldn't leave me alone: what if you **computed** on the compressed form directly? Decode a node on-demand into a 16-byte local struct, do the apply work, write back. Append-only storage means child references can be byte offsets that are monotonically backward — which the LEB128 bias toward small values compresses well by construction.
 
@@ -39,7 +39,7 @@ If this works:
 - Append-only → mark-and-sweep GC at batch boundaries, no concurrent-access contention.
 - Single codec for compute, storage, and transfer: dump the arena verbatim to disk; load is memcpy + a DFS to rebuild the unique table.
 
-If it doesn't: at minimum we have a good serialization codec (which the SHIM.md already flagged as a todo), and we've learned where the variable-width hypothesis breaks down on compute.
+If it doesn't: at minimum we have a good serialization codec (BDD dump/load is chronically underspecified in the literature), and we've learned where the variable-width hypothesis breaks down on compute.
 
 
 ## 2. The design
@@ -83,7 +83,7 @@ The manager (`src/manager.rs`) owns three pieces:
 
 `ite` is a Shannon expansion with memoization. v0 was recursive; the current version is iterative with an explicit `Vec<Frame>` worklist to avoid stack overflow on deep BDDs. Each frame is either `Enter` (compute cofactors, push children) or `Combine` (children's results are in the cache, make this node).
 
-All operations are `&mut self`. The Rust borrow checker gives us "one writer at a time" for free, at the type level, with no runtime locking cost. This sidesteps the footgun that OxiDD's multi-reader/single-writer design imposes on callers (see footgun section in the parent `SHIM.md`). For workloads that are inherently serial (fixpoint loops), this is a strict upgrade.
+All operations are `&mut self`. The Rust borrow checker gives us "one writer at a time" for free, at the type level, with no runtime locking cost. This sidesteps a footgun in OxiDD's multi-reader/single-writer design: a caller holding a read lock that happens to trigger a BDD construction operation elsewhere (even via a helper that looks read-only from the caller's perspective) can deadlock. For workloads that are inherently serial (fixpoint loops), our single-writer-by-borrow is a strict upgrade.
 
 
 ### 2.3 Copying GC at batch boundaries
@@ -164,7 +164,7 @@ At k=8 (122,309 nodes), current state (post-GC, so apply cache is empty):
 
 Note the apply cache is now a fixed-size allocation (2^17 slots × 40 B) regardless of problem size. At k=8 it fits our working set; at k=2 it's 170 KB/node overhead (but 170 KB total is trivial). At k=10+ it will partially collide-evict, which is the correct failure mode for an apply cache.
 
-OxiDD's comparable footprint at the same node count, based on its docs and the SHIM.md numbers: ~16 B/node (node table) + a similarly-sized apply cache ≈ 33 B/node total + ~2 MB cache.
+OxiDD's comparable footprint at the same node count, based on its docs and our measurements: ~16 B/node (node table) + a similarly-sized apply cache ≈ 33 B/node total + ~2 MB cache.
 
 So we're at **rough parity** on total live memory, not the 3-5× win the arena number alone suggests. The arena is tiny and elegant; the unique table is dense and ordinary. Together they land at the same order of magnitude as a well-tuned fixed-width engine.
 

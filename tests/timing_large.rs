@@ -53,7 +53,6 @@ fn run_ox(k: u32) -> (f64, usize) {
     let inner_node_cap = 1 << 27; // 128M slots max (k=12 needs ~30M)
     let apply_cache_cap = 32 * 1024 * 1024; // oxidd-cli's default
     let mref = oxidd_new_manager(inner_node_cap, apply_cache_cap, 1);
-    let mref = oxidd_new_manager(inner_node_cap, apply_cache_cap, 1);
     let (x, y, z, tt, ff) = mref.with_manager_exclusive(|mgr| {
         let names: Vec<String> = (0..k)
             .map(|i| format!("x{}", i))

@@ -89,6 +89,7 @@ dependencies = [
 [[package]]
 name = "hugealloc"
 version = "0.1.1"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "allocator-api2",
  "libc",
@@ -110,6 +111,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "linear-hashtbl"
 version = "0.1.4"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 
 [[package]]
 name = "litrs"
@@ -141,6 +143,7 @@ checksum = "6e3d189da485332e96ba8a5ef646a311871abd7915bf06ac848a9117f19cf6e4"
 [[package]]
 name = "oxidd"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "cfg-if",
  "derive-where",
@@ -161,6 +164,7 @@ dependencies = [
 [[package]]
 name = "oxidd-cache"
 version = "0.11.1"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "allocator-api2",
  "document-features",
@@ -172,6 +176,7 @@ dependencies = [
 [[package]]
 name = "oxidd-core"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "nanorand",
 ]
@@ -179,6 +184,7 @@ dependencies = [
 [[package]]
 name = "oxidd-derive"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
@@ -189,6 +195,7 @@ dependencies = [
 [[package]]
 name = "oxidd-dump"
 version = "0.6.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "document-features",
  "fixedbitset",
@@ -202,6 +209,7 @@ dependencies = [
 [[package]]
 name = "oxidd-manager-index"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "crossbeam-utils",
  "derive-where",
@@ -216,6 +224,7 @@ dependencies = [
 [[package]]
 name = "oxidd-reorder"
 version = "0.6.1"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "flume",
  "is_sorted",
@@ -227,6 +236,7 @@ dependencies = [
 [[package]]
 name = "oxidd-rules-bdd"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "document-features",
  "fixedbitset",
@@ -238,6 +248,7 @@ dependencies = [
 [[package]]
 name = "oxidd-rules-mtbdd"
 version = "0.6.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "document-features",
  "fixedbitset",
@@ -249,6 +260,7 @@ dependencies = [
 [[package]]
 name = "oxidd-rules-tdd"
 version = "0.6.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "document-features",
  "oxidd-core",
@@ -259,6 +271,7 @@ dependencies = [
 [[package]]
 name = "oxidd-rules-zbdd"
 version = "0.11.0"
+source = "git+https://github.com/rndmcnlly/oxidd.git?rev=b7fdc97#b7fdc9731cdf6225e3a3ad27510478e197a9f7c7"
 dependencies = [
  "document-features",
  "fixedbitset",

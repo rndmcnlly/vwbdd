@@ -2,11 +2,26 @@
 name = "vwbdd"
 version = "0.0.1"
 edition = "2021"
+description = "A variable-width BDD engine: append-only LEB128 arena, verify-on-decode unique table, and a byte-level dump format that doubles as IPC payload"
+license = "MIT"
+repository = "https://github.com/rndmcnlly/vwbdd"
+readme = "README.md"
+keywords = ["bdd", "decision-diagram", "compression", "symbolic"]
+categories = ["algorithms", "data-structures", "compression"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 
+# oxidd is a dev-dep only, used by the differential / timing / compression
+# test harnesses to cross-check correctness and compare wall-clock behavior
+# against a well-engineered reference BDD engine. vwbdd's library build has
+# zero runtime dependencies.
+#
+# Pinned at rndmcnlly/oxidd @ b7fdc97 (wasm32-support branch) — differs from
+# upstream oxidd/oxidd main by one commit that adds wasm32 support to
+# oxidd-manager-index. Irrelevant to vwbdd's native tests, but pinned for
+# reproducibility of the measurements recorded in VWBDD.md.
 [dev-dependencies]
-oxidd = { path = "../oxidd/crates/oxidd" }
+oxidd = { git = "https://github.com/rndmcnlly/oxidd.git", rev = "b7fdc97" }
