@@ -1,0 +1,12 @@
+[package]
+name = "vwbdd"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+oxidd = { path = "../oxidd/crates/oxidd" }
