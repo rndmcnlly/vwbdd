@@ -1,33 +1,29 @@
-//! Node encoding backends.
+//! Variable-width node encoding: one raw `u8 var` prefix, then two
+//! LEB128-encoded child codes.
 //!
-//! Three mutually exclusive encodings of `(var, lo, hi)` into the arena byte
-//! buffer are selectable via Cargo features. All assume `var < 256` (we never
-//! realistically run with more variables; at k=11 we use 44):
+//! Layout:
+//!   [u8 var] LEB128(lo_code) LEB128(hi_code)
 //!
-//! - `encoding-interleaved` (default):
-//!     [u8 var] LEB128(interleave(lo_code, hi_code))
-//!   The §4.2 layout with the §4.10 `var`-is-raw-u8 fast path.
+//! Child reference encoding:
+//!   0             -> Terminal(false)
+//!   1             -> Terminal(true)
+//!   2 + delta     -> Node at arena offset (current_offset - delta)
 //!
-//! - `encoding-per-field`:
-//!     [u8 var] LEB128(lo_code) LEB128(hi_code)
-//!   Three fields; no pair math. Same u8-var fast path.
-//!
-//! - `encoding-fixed`:
-//!     repr-C [u32; 3] = (var, lo_packed, hi_packed), 12 B/node total.
-//!   Ceiling comparison with no varint decode at all.
-//!
-//! Child reference encoding (`ref_to_code`/`code_to_ref`):
-//!   0                 -> false terminal
-//!   1                 -> true terminal
-//!   2 + delta         -> node at (current_node_offset - delta)
-//!
-//! All backends expose the same API:
-//!   encode_node_at(var, lo, hi, current_offset, out)
-//!   decode_node_at(buf, current_offset) -> (Node, bytes_consumed)
-//!   decode_var_at(buf, current_offset)  -> (var, bytes_consumed_if_only_var)
-//!
-//! The last is a fast path for `var_of` which is called twice per `make_node`
-//! (ordering assertion) and once per `cofactor` / `top_var`.
+//! Design notes:
+//! - `var` is a raw byte (not LEB128) so `var_of` is a single buf[off] read.
+//!   At any realistic BDD scale there are < 256 variables; debug-asserted.
+//! - Child codes are back-pointer deltas so a node's children always come
+//!   before it in the append-only arena. Deltas shrink to 1-2 LEB bytes for
+//!   nearby children, grow as deep DAGs accumulate skips.
+//! - An earlier design stored `v_skip` (parent's var minus own var) instead
+//!   of `var` directly; that saved ~0.5-1 B/node but forced decode to look
+//!   up children's vars in a side HashMap (~10 ns/lookup × 2). Inline var
+//!   pays the byte for a 2-3× decode speedup. (§4.2 in VWBDD.md.)
+//! - An earlier design interleaved lo/hi into a single LEB128 varint; on
+//!   large workloads that was a near-wash in bytes and cost ~2-6% in decode
+//!   time, so we dropped it (§4.10).
+
+use crate::leb::{decode_u128, encode_u128};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ref {
@@ -66,27 +62,33 @@ pub fn code_to_ref(code: u64, current_offset: u64) -> Ref {
     }
 }
 
-// ---- Feature dispatch -------------------------------------------------------
+pub fn encode_node_at(
+    var: u32,
+    lo: Ref,
+    hi: Ref,
+    current_offset: u64,
+    out: &mut Vec<u8>,
+) {
+    debug_assert_eq!(out.len() as u64, current_offset);
+    debug_assert!(var < 256, "var {} exceeds u8 (raise cap if needed)", var);
+    out.push(var as u8);
+    let lo_code = ref_to_code(lo, current_offset);
+    let hi_code = ref_to_code(hi, current_offset);
+    encode_u128(lo_code as u128, out);
+    encode_u128(hi_code as u128, out);
+}
 
-#[cfg(all(feature = "encoding-per-field", feature = "encoding-interleaved"))]
-compile_error!("encoding-per-field and encoding-interleaved are mutually exclusive");
-#[cfg(all(feature = "encoding-fixed", feature = "encoding-interleaved"))]
-compile_error!("encoding-fixed and encoding-interleaved are mutually exclusive");
-#[cfg(all(feature = "encoding-fixed", feature = "encoding-per-field"))]
-compile_error!("encoding-fixed and encoding-per-field are mutually exclusive");
+pub fn decode_node_at(buf: &[u8], current_offset: u64) -> (Node, usize) {
+    let var = buf[0] as u32;
+    let (lo_code, n1) = decode_u128(&buf[1..]);
+    let (hi_code, n2) = decode_u128(&buf[1 + n1..]);
+    let lo = code_to_ref(lo_code as u64, current_offset);
+    let hi = code_to_ref(hi_code as u64, current_offset);
+    (Node { var, lo, hi }, 1 + n1 + n2)
+}
 
-// Default: interleaved (the §4.2 historical baseline).
-#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
-mod interleaved;
-#[cfg(not(any(feature = "encoding-per-field", feature = "encoding-fixed")))]
-pub use interleaved::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
-
-#[cfg(feature = "encoding-per-field")]
-mod per_field;
-#[cfg(feature = "encoding-per-field")]
-pub use per_field::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
-
-#[cfg(feature = "encoding-fixed")]
-mod fixed;
-#[cfg(feature = "encoding-fixed")]
-pub use fixed::{decode_node_at, decode_var_at, encode_node_at, ENCODING_NAME};
+/// Fast path for `var_of`: one byte, no varint.
+#[inline]
+pub fn decode_var_at(buf: &[u8], _current_offset: u64) -> (u32, usize) {
+    (buf[0] as u32, 1)
+}

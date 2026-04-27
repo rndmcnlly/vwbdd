@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 
 use crate::node::{decode_node_at, decode_var_at, encode_node_at, Node, Ref};
-use crate::profile;
 
 /// Compact open-addressed unique table. Struct-of-arrays: one `Vec<u32>` of
 /// arena offsets (plus one, so 0 means empty) alongside a parallel `Vec<u8>`
@@ -97,7 +96,6 @@ impl CompactUnique {
             if t == tag {
                 let slot = self.slots[i];
                 let off = (slot - 1) as u64;
-                let _t = profile::Guard::new(profile::Phase::DecodeVerify);
                 let (n, _) = decode_node_at(&buf[off as usize..], off);
                 if n.var == var && n.lo == lo && n.hi == hi {
                     return Some(off);
@@ -141,7 +139,6 @@ impl CompactUnique {
                 continue;
             }
             let off = (slot - 1) as u64;
-            let _t = profile::Guard::new(profile::Phase::DecodeResize);
             let (n, _) = decode_node_at(&buf[off as usize..], off);
             let h = unique_key_hash(n.var, n.lo, n.hi);
             let tag = tag_of_hash(h);
@@ -397,7 +394,6 @@ impl Manager {
         match r {
             Ref::Terminal(_) => None,
             Ref::Node(off) => {
-                let _t = profile::Guard::new(profile::Phase::VarOf);
                 let (var, _) = decode_var_at(&self.buf[off as usize..], off);
                 Some(var)
             }
@@ -408,7 +404,6 @@ impl Manager {
         match r {
             Ref::Terminal(_) => None,
             Ref::Node(off) => {
-                let _t = profile::Guard::new(profile::Phase::DecodeNode);
                 let (n, _) = decode_node_at(&self.buf[off as usize..], off);
                 Some(n)
             }
@@ -441,10 +436,7 @@ impl Manager {
             return Ref::Node(off);
         }
         let new_off = self.buf.len() as u64;
-        {
-            let _t = profile::Guard::new(profile::Phase::Encode);
-            encode_node_at(var, lo, hi, new_off, &mut self.buf);
-        }
+        encode_node_at(var, lo, hi, new_off, &mut self.buf);
         self.unique.insert(hash, new_off, &self.buf);
         Ref::Node(new_off)
     }
