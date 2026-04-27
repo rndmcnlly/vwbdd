@@ -700,6 +700,94 @@ The ratio is flat at 2.5-3.1× across a **176× growth in node count** (k=12 →
 **What the ratio would look like if we matched oxidd's cache entry size.** If we went from 16 B PackedRef entries to 40 B full-key entries (no verify-on-decode), we'd stop paying `decode_node_at` on every cache miss verification, and our 2M-slot cache would functionally behave like oxidd's. But the memory footprint would grow from 32 MB to 80 MB, and we'd lose the architectural parity with §4.7's "don't store the key" insight. A future session could explore this as an A/B but it's not obviously a win.
 
 
+### 4.14 Dump/load and the multi-process primitive
+
+The arena is already a byte stream; it just needed a header. `src/dump.rs` adds the wrapper, plus a merge primitive (`absorb`) that makes multi-process parallelism a natural application of the existing canonicalization discipline.
+
+**Motivation.** vwbdd's `&mut self` design rules out multi-thread parallelism inside a single manager: borrow-checking enforces one writer at a time. That sounds like a handicap until you notice that the append-only arena and deterministic-hash unique table make *multi-process* parallelism unusually easy. Append-only means a mmap'd shared-read view is safe by construction: no writer means no barriers. Deterministic `splitmix64` hashing on fixed-layout `(var, lo, hi)` triples means any process reconstructing the unique table from the same bytes gets the same slot assignments. If we can serialize an arena and re-ingest it with dedup, we have the pieces to stitch partitions together.
+
+The hard part of parallel BDD compute is usually *fine-grained* sharing during the `ite` recursion: threads contend for the unique table on every `make_node`. That's what oxidd's multi-threaded mode manages carefully with lock-free slot CAS and atomic refcounts. The *coarse-grained* parallelism — partition the problem, let each worker build independently, merge — is barely covered in the BDD literature, because most engines don't have a cheap merge primitive. Ours does, because the arena *is* the merge input.
+
+**Format.** Little-endian, 32-byte header + raw arena bytes + absolute-encoded root refs + optional length-prefixed UTF-8 names + 4-byte CRC32.
+
+```text
+[8 B magic "VWBDD\0\0\0"]
+[2 B format_version]
+[1 B offset_width: 4=u32, 8=u64]
+[1 B flags: bit 0 = has_root_names]
+[4 B num_vars]
+[4 B num_roots]
+[8 B arena_len]
+[4 B reserved]
+[arena_len bytes of raw Leb128Codec-encoded nodes]
+[num_roots × 8 B of wire-encoded refs (0=F, 1=T, 2+off=Node)]
+[optional: num_roots × (2 B length + UTF-8 name)]
+[4 B CRC32]
+```
+
+Design choices:
+
+- **Multi-root first-class.** `num_roots: u32` with a parallel list of `u64`-encoded refs. `num_roots = 1` is the single-root case at no per-byte cost. Matches DDDMP's long-established convention (CUDD's export format has supported multiple roots via `.nroots` + `.rootids` since the 1990s) and fits the natural BDD workflows: transition systems ship `{init, trans, reached}`; bitblasted circuits ship one function per output bit; partitioned computations ship `{T₁, T₂, ..., Tₙ}` for downstream OR.
+- **Named roots optional via flag bit.** The common case (positional roots) pays zero bytes for names. Named mode adds one length-prefixed UTF-8 entry per root, for transition-system artifacts that want to preserve `init`, `trans`, etc. as first-class labels.
+- **CRC32 at the tail.** Validates the whole file including header. Cheap (~1 GB/s), catches torn writes and bit-rot. Implemented inline with a 30-line Rust CRC32 (IEEE polynomial 0xedb88320) to keep the crate dep-free.
+- **Offset-width byte in the header.** A `u32` dump can load into a `u32` or `u64` engine (widening is free); a `u64` dump fails to load into a `u32` engine if any offset exceeds `u32::MAX`. The load path checks per-ref.
+- **Absolute root encoding via the child-code convention.** `0 = Terminal(false)`, `1 = Terminal(true)`, `2 + off = Node(off)`. Reuses the arena's per-child encoding but with an absolute offset rather than a back-reference delta. Natural and self-describing.
+- **No magic per node.** Individual nodes aren't self-delimiting because the arena is decoded sequentially and we know `arena_len` up front. The header's byte count is the only framing.
+
+**Three operations on `Manager`:**
+
+```rust
+fn dump(&self, path, roots: &[Ref<O>]) -> Result<()>;
+fn dump_named(&self, path, roots_and_names: &[(Ref<O>, &str)]) -> Result<()>;
+
+fn load(path) -> Result<(Self, LoadedRoots<O>)>;              // fresh engine
+fn load_with_config(path, config) -> Result<(Self, LoadedRoots<O>)>;
+
+fn absorb(&mut self, path) -> Result<Vec<Ref<O>>>;            // merge into self
+```
+
+`load` is the simple case: fresh manager, arena bytes copied verbatim (the bytes in the file are already canonical under this codec), unique table rebuilt by a single linear walk. Total load cost: O(bytes) for the filesystem read, O(nodes) for the table rebuild. No decompression, no per-node allocations. At ~5 B/node in the arena plus ~9 B/slot in the unique table, a k=15 dump (10M nodes) is ~50 MB of disk + a ~15 MB unique table rebuild, maybe 200 ms on SSD hardware.
+
+`absorb` is the interesting one. It walks the foreign arena in construction order, decodes each node, translates its children through a running `HashMap<foreign_offset, local_ref>`, and re-interns via `make_node`. The key property: because `make_node` is canonicalizing, any subgraph that already exists in the receiver collapses to the existing offset. **A worker's node that was already built by a previous absorb comes back as the same `Ref`, without growing the arena.** The deduplication is free — it's the same unique-table logic that deduplicates inside a single session, applied across session boundaries.
+
+**The multi-process pattern.** The sketch we'd use for disjunctive partitioning:
+
+```rust
+// Parent builds the shared scaffold (variables, constants, primed vars).
+let mut parent = Manager::new();
+declare_transition_variables(&mut parent);
+// ... optionally dump and freeze as a shared base, or just leave empty.
+
+// Fork N workers. Each builds one partition:
+let worker_output = |i: usize| {
+    let mut w = Manager::new();
+    declare_transition_variables(&mut w);       // same declaration order
+    let t_i = build_transition_partition_i(&mut w);
+    w.dump(format!("/tmp/partition_{i}.vwbdd"), &[t_i])?;
+    Ok(())
+};
+// ... launch via std::process::Command / fork / MPI / etc.
+
+// Parent merges:
+let mut merged_roots = Vec::new();
+for i in 0..N {
+    let roots = parent.absorb(format!("/tmp/partition_{i}.vwbdd"))?;
+    merged_roots.push(roots[0]);
+}
+let t = parent.or_many(&merged_roots);
+```
+
+No threads, no locks, no shared memory primitives, no rayon dependency. Filesystem (or named pipes, or a socket delivering the dump bytes) is the sync point. Each worker runs at the same single-thread speed vwbdd already achieves; the parallelism happens at the process boundary, not inside the `ite` recursion.
+
+**Deduplication across absorbs.** Tested directly: if worker A dumps formula `F₁` and worker B dumps `F₂`, and both formulas contain the subgraph `(x₀ ∧ x₁)` independently, the parent after `absorb(A); absorb(B)` contains that subgraph exactly once. The test (`tests/dump.rs::absorb_dedupes_shared_subgraphs`) builds both formulas in a reference manager and asserts the absorbed parent's node count matches exactly. Canonicity + deterministic hashing does the work.
+
+**Performance shape.** `absorb` is roughly as expensive as building the worker's BDD from scratch in the parent: each node goes through `make_node`, which does a unique-table probe plus maybe an arena write. What the absorb buys you is *that work already happened in parallel in the worker*. If a k=15 partition takes 12 s in a worker and 150 ms to absorb back into the parent, N workers in parallel finish in roughly `max_worker_time + N × absorb_time`. For N=4 workers all running ~12 s, total wall time is ~12 + 4×0.15 ≈ 12.6 s vs ~48 s sequential. 4× speedup at the cost of some disk I/O.
+
+**What this doesn't do (yet).** There's no shared-base mmap story: each worker builds its partition independently from scratch, including re-building any scaffolding that every partition uses. A future addition would be a "frozen snapshot" mode where the parent dumps a base arena with its unique table, and workers mmap it as a read-only prefix, appending local nodes on top. That cuts worker setup time but adds complexity; left for a session that has a concrete workload demonstrating the waste. The present `absorb` semantics are sufficient for the immediate use case: partition, build, merge.
+
+**The broader architectural claim.** Between §4.13 (tunable apply cache) and §4.14 (dump/load/absorb), vwbdd now offers the full "application developer drives policy, library provides mechanisms" stance across all three resource dimensions: memory (ManagerConfig), GC (manual, copying), and parallelism (manual, multi-process via absorb). The contrast with oxidd is sharp in this last dimension: oxidd shapes its multi-threaded design around a lock-free coordination protocol that's hard for the caller to opt out of; we offer no intra-manager parallelism at all, and trade that away for a merge primitive the application uses however it wants. Both are valid designs; they optimize for different caller philosophies.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -716,7 +804,7 @@ Things we'd want before calling this a real engine:
 
 **Decoded-node cache.** For very hot nodes (usually the ones near the roots of the current operation), cache the decoded `(var, lo, hi)` in a small fixed-width table to skip repeated LEB128 work. Not yet attempted.
 
-**Dump/load.** The arena is already a serialized form; `dump` is `write(&self.buf)` plus metadata. `load` is `read` + rebuild unique table. Could be ~30 lines.
+**Shared-base dump snapshots.** §4.14 landed dump/load/absorb for the partition-build-merge pattern. A further refinement is a "frozen snapshot" mode: parent writes a base arena + unique table, workers mmap it as a read-only prefix and build local tails on top, sharing the scaffold bytes across processes without per-worker rebuild cost. Worth doing when a concrete workload shows that per-worker scaffold rebuilds dominate.
 
 **Compile-time safety against dangling refs across GC.** Make `Ref` lifetime-parameterized so the compiler refuses to let you use a pre-GC ref after a GC call. Standard Rust arena-handle trick.
 
@@ -756,7 +844,7 @@ The experiment's shape reversed cleanly: we went in thinking the arena was the h
 
 ```
 vwbdd/
-├── Cargo.toml                   — dev-dep on ../oxidd/crates/oxidd
+├── Cargo.toml                   — zero runtime deps; dev-dep on ../oxidd/crates/oxidd
 ├── VWBDD.md                     — this document
 ├── src/
 │   ├── lib.rs                   — module glue, public re-exports, type aliases (§4.12)
@@ -764,6 +852,7 @@ vwbdd/
 │   ├── codec.rs                 — ArenaOffset + NodeCodec traits; Leb128Codec impl (§4.12)
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
 │   ├── unique.rs                — CompactUnique<C, O>: linear-probe, generic slot width (§4.7)
+│   ├── dump.rs                  — .vwbdd native format: dump/load/absorb multi-root with CRC32 (§4.14)
 │   └── manager.rs               — live engine: Manager<C, O>, ManagerConfig, make_node, ite, and/or/xor/not, gc, apply cache (§4.13)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
@@ -772,6 +861,7 @@ vwbdd/
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
     ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
+    ├── dump.rs                  — .vwbdd roundtrip: single/multi-root, named, absorb dedup, error paths (§4.14)
     ├── large_manager.rs         — LargeManager smoke + u32/u64 cross-width agreement (§4.12)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
@@ -783,5 +873,5 @@ vwbdd/
     └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
 ```
 
-Total: 57 tests passing, 2 #[ignore]'d timing sweeps.
+Total: 65 tests passing, 3 #[ignore]'d timing sweeps.
 

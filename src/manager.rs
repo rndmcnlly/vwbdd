@@ -250,6 +250,22 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
         &self.buf[off..]
     }
 
+    /// Mutable access to the arena buffer. Used only by the crate-internal
+    /// dump/load path (`src/dump.rs`) to append raw bytes after a file
+    /// read. Callers must follow up with
+    /// [`Manager::rebuild_unique_from_arena`] so the unique table reflects
+    /// the new nodes.
+    pub(crate) fn buf_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Walk the current arena in construction order and rebuild the unique
+    /// table from scratch. Used internally by [`Self::gc`] and by the
+    /// dump/load path in `src/dump.rs`.
+    pub(crate) fn rebuild_unique_from_arena(&mut self) {
+        self.unique_rebuild_from_arena();
+    }
+
     /// Memory breakdown (arena + unique + cache). `unique_bytes` includes
     /// empty slots; at 0.75 load the linear-probe table runs ~(1.33 × slot_width)
     /// bytes per node. `cache_bytes` reflects the cache size chosen at
