@@ -688,8 +688,12 @@ This mirrors `Vec::new` vs `Vec::with_capacity` (stdlib) and oxidd's "caller pic
 | 13 | 1.3M | 951 | 386 | 505 | 2.47× | 1.88× |
 | 14 | 3.7M | 3,564 | 1,275 | 1,632 | 2.80× | 2.18× |
 | 15 | 10.3M | 11,812 | 4,693 | 5,329 | **2.51×** | **2.22×** |
+| 16 | 29.5M | 39,359 | 13,519 | 21,833 | 2.91× | 1.80× |
+| 17 | 82.3M | 141,235 | 46,127 | **OOM** | 3.06× | — |
 
-The ratio is flat at 2.5-2.8× across a 22× growth in node count. That's the real answer to "how does vwbdd compare at scale": not 6.97× as the unfixed cache suggested, not 1.75× as the §4.12 writeup claimed (that number was on the *full* 2k-bit relation with different variable ordering characteristics). On this specific iota-style workload, steady state is ~2.6× slower than oxidd native, ~2.1× slower than oxidd-wasm in a browser.
+The ratio is flat at 2.5-3.1× across a **176× growth in node count** (k=12 → k=17). That's the real answer to "how does vwbdd compare at scale": not 6.97× as the unfixed cache suggested, not 1.75× as the §4.12 writeup claimed (that number was on the *full* 2k-bit relation with different variable ordering characteristics). On this specific iota-style workload, steady state is ~2.5-3× slower than oxidd native.
+
+**At k=17 we run a workload iota-wasm cannot.** iota OOMs at k=17 because oxidd's 40 B/entry node table × ~80M nodes = ~3.2 GB exceeds the 4 GiB wasm32 linear-memory ceiling. vwbdd finishes the same workload in 1.12 GB engine total (arena 445 MB + unique ~670 MB + cache 32 MB), with room to spare inside the u32 arena cap. This is the architectural payoff of the variable-width design in its clearest form yet: **we can run a browser-scale BDD workload that oxidd-wasm cannot, on the same 4 GiB memory budget.**
 
 **Reconciling with §4.12's numbers.** The full-relation k=11 landing at 1.75× and the truncated k=15 landing at 2.51× aren't inconsistent — they're measuring different functions. The full 2k-bit relation with 44 variables produces BDDs whose internal structure happens to be friendlier to our variable-width codec (more locality → more 1-byte LEB128 deltas). The truncated relation with 3k=45 variables produces denser interconnect (k-bit product crossing through a k-bit equality) where the byte-per-edge advantage shrinks. Both are real; neither is the full story. The honest framing is "2-3× slower than oxidd, with the constant depending on workload graph structure."
 
@@ -736,6 +740,8 @@ For a **compute engine racing OxiDD/CUDD on speed alone**: no, but close. At k=1
 For a **memory-constrained engine that can handle bigger DAGs on fixed hardware**: **yes, this is the sharp end of the trade**. At k=11 on the default build, vwbdd holds 7.6M live BDD nodes in **~121 MB** total (35 MB arena + 84 MB unique table + 2 MB apply cache); OxiDD needs ~244 MB for the same. For deployments where the arena will stay under 4 GiB — wasm clients, browser inference, anything that ships a prepared diagram to a constrained target — the default `Manager<Leb128Codec, u32>` is the right build. For server-side builders that need to absorb tens of GB before serializing, switch to `LargeManager = Manager<Leb128Codec, u64>`: same library, different type alias, no runtime dispatch.
 
 For a **server/client pipeline** (§4.12's key motivation): build with `LargeManager`, serialize the arena as-is (it's already a byte buffer), ship it to a wasm client running `DefaultManager` for inference. The `Leb128Codec` produces the same byte layout at both widths, so the receiving engine just indexes the arena using its own offset type. This wasn't a design goal when the codec was written; it fell out of the variable-width architecture naturally.
+
+**Concretely demonstrated** at k=17 of the iota truncated-mult workload (§4.13): 82.3M BDD nodes, iota-wasm (running vanilla oxidd compiled to wasm32) runs out of memory inside the 4 GiB linear-memory ceiling; vwbdd finishes the same workload in 1.12 GB. The browser-target budget that bounds iota doesn't bound us on the same problem, on the same hardware.
 
 For a **compressed storage/transfer format that can also query**: yes. The arena is self-contained, serializable by memcpy, 3.5-4× smaller than dd.autoref's JSON or OxiDD's DDDMP. Querying doesn't require rebuilding a full engine — you can evaluate a BDD on a valuation by walking the compressed arena directly, which is how the FDG paper's downstream consumers would want it.
 

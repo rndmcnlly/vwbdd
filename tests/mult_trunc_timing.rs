@@ -83,8 +83,10 @@ fn mult_trunc_sweep() {
         "k", "nodes", "vwbdd (ms)", "oxidd (ms)", "ratio", "arena B/n", "total B/n"
     );
 
-    // Smoke sweep: small k only. Bump the list when scaling further.
-    let ks: &[u32] = &[15];
+    // iota's demo sweeps k = 7, 10, 12..17. Matching that lineup lets us
+    // line rows up directly with the in-browser numbers. k=17 takes ~3 min
+    // on an M3 Max; the full sweep is ~4 min total.
+    let ks: &[u32] = &[7, 10, 12, 13, 14, 15, 16, 17];
 
     for &k in ks {
         let handle = std::thread::Builder::new()
