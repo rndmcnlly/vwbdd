@@ -8,20 +8,21 @@ Audience: the author, future collaborators, and anyone curious whether variable-
 
 ## TL;DR
 
-We built a single-file Rust BDD engine where each node is encoded as two LEB128 varints (`var`, then an interleave of backward-offset child references) into an append-only byte buffer. Canonicity is enforced by a unique table keyed on a cheap hash of `(var, lo, hi)`, with collisions resolved by decoding and verifying.
+We built a single-file Rust BDD engine where each node is encoded as a raw u8 `var` byte followed by two LEB128-encoded back-reference child codes, stored in an append-only byte buffer. Canonicity is enforced by a unique table keyed on a cheap hash of `(var, lo, hi)`; on probe, collisions are resolved by decoding the arena node and verifying.
 
-Across the mult-relation `x*y=z` from k=2 to k=8 (reachable nodes 29 to 122k):
+Across the mult-relation `x*y=z` from k=2 to k=11 (reachable nodes 29 to 7.6M):
 
 - **Correctness**: node counts match OxiDD exactly at every scale, verified differentially via a shared bitblaster running both engines in the same test.
 - **Arena compression**: post-GC, we store BDD nodes at **2.6 to 4.6 bytes each** (k=2 to k=11) vs OxiDD's fixed 16 B/node. Dominant factor is the byte-offset distance to child nodes, which LEB128 compresses well.
-- **Unique-table compression** (§4.7): struct-of-arrays compact table — `Vec<u32>` offsets + parallel `Vec<u8>` hash tags, 5 B/slot at 0.75 load. Exploits the observation that node offsets always fit in 32 bits (arena < 4 GB at any practical k). **~6.7 B/node**, down from 32 B/node for hashbrown.
-- **Apply-cache compression** (§4.8): a 4-byte `PackedRef` lets each direct-mapped cache entry fit in 16 B (exactly one cache line), down from 72 B. Cache total shrinks from 9 MB to **2 MB**, and every probe reads exactly one cache line.
+- **Unique-table compression** (§4.7): `CompactUnique` — `Vec<u32>` offsets + parallel `Vec<u8>` hash tags, 5 B/slot at 0.75 load. Exploits that node offsets always fit in 32 bits (arena < 4 GB at any practical k). **~6.7 B/node**, down from 32 B/node for hashbrown.
+- **Apply-cache compression** (§4.8): a 4-byte `PackedRef` lets each direct-mapped cache entry fit in 16 B (exactly one cache line), down from 72 B. Cache total: 9 MB → **2 MB**.
+- **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
 - **Total live memory**: **~15 B/node** (arena + unique table), plus a 2 MB fixed apply cache. Grand total at k=11: **~15.9 B/live-node**. **Half of OxiDD's ~30-32 B/live-node.**
-- **Wall-clock time**: **~2.7× slower than OxiDD** at k=8, **2.2× at k=11**. Down from 10.8× in v0.
+- **Wall-clock time**: **~2× slower than OxiDD** at k=11. Down from 10.8× in v0.
 
 **Design trade-off, accepted explicitly**: within ~3× of OxiDD on runtime in exchange for **~2× smaller total engine footprint**. For the intended workload — compressed BDDs for FDG reachability on fixed laptop hardware, where working-set size determines whether a problem fits at all — this is the right trade. At k=11, vwbdd holds 7.6M nodes in ~121 MB total; OxiDD needs ~244 MB. A problem that OOMs in OxiDD on a 256 MB budget still runs here.
 
-§4.6 documents four earlier unique-table shrink attempts that *regressed speed without winning memory* (hand-rolled open addressing variants that stored a separate hash tag or full inline key per slot). §4.7 shows what finally worked: **don't store the key at all** (verify-on-decode from the arena), and exploit that offsets fit in u32. §4.8 repeats that "exploit the u32 bound" pattern on the apply cache: pack Refs into u32 so each cache entry is one cache line.
+Three rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design.
 
 
 ## 1. Motivation
@@ -44,14 +45,15 @@ If it doesn't: at minimum we have a good serialization codec (which the SHIM.md 
 
 ### 2.1 Wire format
 
-Each node is two LEB128 varints in sequence:
+Each node is one raw `u8 var` byte followed by two LEB128 varints:
 
 ```
-LEB128(var)                                    // u32, level number (0 = top)
-LEB128(interleave(lo_code, hi_code))           // u128
+u8  var                          // level number (0 = top), raw byte
+LEB128(lo_code)                  // child reference, u128 encoding
+LEB128(hi_code)                  // child reference
 ```
 
-Child reference encoding (u64 before interleaving):
+Child reference encoding:
 
 ```
 0                 -> false terminal
@@ -59,13 +61,13 @@ Child reference encoding (u64 before interleaving):
 2 + delta         -> node at (current_offset - delta), delta >= 0
 ```
 
-The interleave function (`src/pair.rs`) is a pure integer bit-interleave: `x` goes in even bits of the u128, `y` in odd bits. Inverse is bit-gather. Both encode and decode are straight-line integer math, no floating point or branches.
+**Why raw u8 var, not LEB128?** Any realistic BDD workload has far fewer than 256 variables (mult at k=11 uses 44), so a 1-byte var is always cheap. Raw-u8 makes `var_of(r)` a single `buf[off]` read — no state-machine LEB128 parse — and `var_of` is the hottest decode path (2× per `make_node` for ordering asserts, 3× per `ite` frame for the top-var pick, etc). See §4.10.
 
-**Why two LEB128s, not one?** An earlier version packed `v_skip` (the var's distance above children's min-var) together with the interleaved children using Minsky pairing, so a single LEB128 covered everything. That saved ~1 byte per node but required the decode path to look up children's vars from a side HashMap — three times per node, at ~10 ns per lookup. The decode cost dominated the savings. Inline-`var` trades 1 byte/node for ~30 ns/decode. Easy call for a live engine; a storage codec would keep v_skip.
+**Why three separate LEB128s, not one combined varint?** An earlier version bit-interleaved `lo_code` and `hi_code` into a single u128, then LEB128-encoded that. The self-framing interleave avoided storing a length prefix for lo. On small workloads it saved ~17-29% of arena bytes; on the mult-k≥6 workload the pair-math cost matched the compression win, and wall time was ~2-6% slower than the simpler per-field design. We kept simplicity. (§4.10.)
 
-**Why interleave instead of concatenate?** Concatenation would require storing the bit-width of one child so decode knows where to split. Interleave is self-framing: the two LEB128 halves are extracted by bit-gather, no length prefix needed. And small child deltas (the common case: children are a few bytes back in the buffer) produce small interleaved values, which LEB128 encodes in 1-2 bytes.
+**Why LEB128 at all?** Child deltas have wide dynamic range: ~1 byte for adjacent-node back-references (the common case, because ripple-adder structure produces lots of locality), several bytes for cross-level edges in deep DAGs. LEB128 is the right encoding shape.
 
-**Why u128?** Two u64 child codes interleave into 128 bits. LEB128 of a small u128 is the same size as LEB128 of a small u64 — we only pay for the bits we use — so u128 costs nothing for small nodes and removes the arithmetic ceiling entirely (a u64 interleave maxed out at a 4 GiB buffer, which real workloads can exceed).
+**Why not v_skip instead of var?** An even earlier design stored `v_skip = min_child_var - var - 1` (usually 0) so the var field LEB128'd to fewer bytes. Decode had to reconstruct `var` by looking up both children's vars in a side `HashMap<offset, var>` — ~20 ns extra per decode for ~0.5-1 byte saved. Inline `var` is a 2-3× decode speedup for 1 byte/node. Easy call for a live engine; a pure storage codec where decode cost is paid once would keep v_skip.
 
 
 ### 2.2 Append-only arena + unique table + apply cache
@@ -73,9 +75,8 @@ The interleave function (`src/pair.rs`) is a pure integer bit-interleave: `x` go
 The manager (`src/manager.rs`) owns three pieces:
 
 1. `buf: Vec<u8>` — the arena. Nodes are appended as they're built, never mutated.
-2. `unique: HashMap<u64, u64>` — primary unique-table slot. Key is a hash of `(var, lo, hi)`; value is the canonical offset. On lookup, we decode the candidate and verify.
-3. `unique_collisions: HashMap<u64, Vec<u64>>` — secondary for the rare hash collision.
-4. `ite_cache: HashMap<(Ref, Ref, Ref), Ref>` — apply-cache for `ite`.
+2. `unique: CompactUnique` (§4.7, `src/unique.rs`) — open-addressed table with `Vec<u32>` offsets and a parallel `Vec<u8>` of hash tags. Key is a hash of `(var, lo, hi)`; the canonical offset lives in the slot. On tag match we decode the arena node and verify the full key.
+3. `ite_cache: Box<[IteCacheEntry; 2^17]>` (§4.5, §4.8) — direct-mapped apply cache for `ite`. Each entry is a 16 B (`PackedRef × 4`) one-cache-line record; collisions evict.
 
 `make_node(var, lo, hi)` enforces both reduction (if `lo == hi`, return `lo`) and canonicalization (same triple → same offset). Variable ordering is asserted: parent's var must be strictly less than each non-terminal child's var.
 
@@ -489,6 +490,53 @@ The memory prediction was **accurate** (estimated -35%, actual -33%). The speed 
 - **Per-level unique tables** (option 3 from the landscape audit). Still one lookup per op, but to a smaller level-scoped table that fits better in L1. The cache-locality win from small per-level tables *adds* to single-probe lookup rather than replacing it. Likely a different story from cuckoo.
 
 
+### 4.10 Where does time actually go? Encoding-scheme A/B
+
+After §4.9, the obvious remaining question: *how much of our wall time is the variable-width decode costing us?* Before optimizing anything else we wanted a real answer, not a guess. Two complementary measurements:
+
+**1. Phase timing.** Added a compile-time-gated `profile-timing` feature that wraps the hot decode sites (`var_of`, `decode_node`, unique-table verify, unique-table resize, encode) in `std::time::Instant::now()` Guards and accumulates per-phase ns totals. On the mult k=10 workload the breakdown (instrumented build, so absolute numbers are inflated ~2× by `Instant::now` overhead, but ratios survive):
+
+- `var_of`: **~58% of accounted time**, called 4-5× more often than full decode
+- `decode_node`: ~21%
+- `decode_verify` + `decode_resize`: ~17% combined
+- `encode`: ~4%
+- *Unaccounted* (unique-table slot traversal, ite orchestration, hashing, apply-cache probing): ~66% of wall time
+
+That said: `var_of` dominates *among the things we instrumented*, so any encoding change that cheapens `var_of` wins.
+
+**2. Three-backend A/B with a feature flag.** Implemented three mutually exclusive node encodings in `src/node/` subdir, each exposing identical `encode_node_at` / `decode_node_at` / `decode_var_at` APIs:
+
+- `encoding-interleaved` (§4.2 historical): `LEB128(var) | LEB128(interleave(lo, hi))`
+- `encoding-per-field`: `LEB128(var) | LEB128(lo) | LEB128(hi)`
+- `encoding-fixed`: `[u32; 3]` struct, 12 B/node, no varint decode at all (ceiling comparison)
+
+Mult k=8..11 clean wall times, no instrumentation:
+
+| k | interleaved | per-field | fixed12 |
+|---|--:|--:|--:|
+| 8  | 151 ms / 3.94 B/n | 122 ms / 4.06 B/n | 102 ms / 12.00 B/n |
+| 11 | 39.4 s / 4.59 B/n | 41.5 s / 4.62 B/n | 33.3 s / 12.00 B/n |
+
+Fixed12 saves **~16% at k=11 for 2.6× arena bloat** — a terrible trade. Per-field is within 5% of interleaved on both axes; the pair-math is basically free and the compression advantage of interleaving is real only on small BDDs (where both are tiny anyway).
+
+**The u8-var side-pocket.** The profile data also pointed at a cheaper win: `var_of` was spending time in the LEB128 state machine, but at any plausible BDD scale `var < 256`, and LEB128-of-a-value-below-128 is exactly one byte. So: drop the LEB128, store the var as a raw u8, and `var_of(r)` becomes a single `buf[off]` read. Zero bytes gained or lost per node at our working scale.
+
+Measured on interleaved (pre-change vs post-change):
+
+| k | LEB var | u8 var | speedup |
+|---|--:|--:|--:|
+| 8  | 151 ms | 117 ms | **-23%** |
+| 11 | 39.4 s | 37.5 s | **-5%** |
+
+The speedup is large at small k (where `var_of` fraction is highest) and shrinks at large k (where unique-table traversal dominates). **No memory cost.** Pure win.
+
+**Combined post-§4.10 design (current default):** `u8 var` + three independent LEB128s (per-field), no interleave. Timing at k=11: **~37 s / 2.0× OxiDD / 4.62 arena B/n / 15.66 total B/n**. 2-6% faster than the u8-var-interleaved build on mult, roughly the same arena footprint.
+
+**The cleanup pass that followed.** Once the measurement was in, we deleted everything the experiment had rejected: the interleaved backend, `src/pair.rs` (the bit-interleave module, now unused), the fixed12 backend (faster but gives up the whole point), the feature-flag dispatch in `src/node.rs`, and the `profile-timing` instrumentation (it had served its purpose). Also deduplicated three copies of the mult-relation builder into `tests/mult_shared/mod.rs`, extracted `CompactUnique` into `src/unique.rs`, and trimmed a dead field from `MemStats`. Net: **-818 LOC** across src and tests, no behavior change.
+
+Post-simplification: `src/` is 918 LOC across four files (leb, node, unique, manager). `tests/` is 1331 LOC across ten files. Single-file pedagogical aesthetic preserved where it paid off, per-file separation where it clarified.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -501,9 +549,7 @@ Things we'd want before calling this a real engine:
 
 **Tunable / adaptive apply-cache size.** The fixed 2^17-slot direct-mapped cache (§4.5) is undersized at k ≥ 10 on mult (see §3.4's k=10 ratio peak). With §4.8's 16 B/entry, we could now cheaply double or quadruple the slot count without meaningful memory impact (4 MB or 8 MB total). `Manager::new_with_cache_size(n)` plus a sensible growth heuristic would flip the k=10 regime. Low risk, high payoff at large k.
 
-**Decoded-node cache.** For very hot nodes (usually the ones near the roots of the current operation), cache the decoded `(var, lo, hi)` in a small fixed-width table to skip repeated LEB128 work. This is the hybrid architecture I mentioned earlier. Not yet attempted.
-
-**(Resolved — see §4.7):** the unique-table HashMap is gone. Compact struct-of-arrays table (u32 offsets + u8 hash tags) achieves ~6.7 B/node and stays within 3× of OxiDD on speed. §4.6 documents four *unsuccessful* variants that came first; the §4.7 design is what finally worked.
+**Decoded-node cache.** For very hot nodes (usually the ones near the roots of the current operation), cache the decoded `(var, lo, hi)` in a small fixed-width table to skip repeated LEB128 work. Not yet attempted.
 
 **Dump/load.** The arena is already a serialized form; `dump` is `write(&self.buf)` plus metadata. `load` is `read` + rebuild unique table. Could be ~30 lines.
 
@@ -534,6 +580,8 @@ For a **single-file pedagogical engine that demonstrates BDD canonicity, Shannon
 
 The experiment's shape reversed cleanly: we went in thinking the arena was the hypothesis and the unique table was "settled infrastructure." We came out with the arena confirmed *and* the unique table cut by 4×, with clear negative-result records (§4.4, §4.6, §4.9) showing exactly which shrink attempts don't work and why. §4.9 in particular records a case where a pre-implementation estimate was wrong by 2-3× in the speed dimension; the honest writeup of what the estimate got wrong is probably the most valuable single section in this document for anyone planning their next optimization on a different BDD engine.
 
+§4.10 closed the book on the other way this might have gone wrong: we had assumed variable-width decode was costing us perhaps ~30% of wall time; the A/B showed it was closer to ~16% (and only recoverable by giving up the whole point of the project). The concrete win from that session came from a sideways observation — `var < 256` means `var` shouldn't be LEB128 at all — which was worth 5-23% depending on k for zero bytes. **Measurements first, optimizations second; the boring observation often beats the clever one.**
+
 
 ## 7. File index
 
@@ -544,25 +592,22 @@ vwbdd/
 ├── src/
 │   ├── lib.rs                   — module glue, public re-exports
 │   ├── leb.rs                   — unsigned LEB128 u128 encode/decode
-│   ├── pair.rs                  — interleave (u64, u64) → u128, Minsky pair (unused in current node.rs but kept for reference)
-│   ├── node.rs                  — single-node encode/decode: LEB128(var) + LEB128(interleave(lo,hi))
-│   └── manager.rs               — live engine: make_node, ite, and/or/xor/not, gc
+│   ├── node.rs                  — single-node encode/decode: u8 var + LEB128(lo) + LEB128(hi)
+│   ├── unique.rs                — CompactUnique: u32 offsets + u8 hash tags, linear probe (§4.7)
+│   └── manager.rs               — live engine: make_node, ite, and/or/xor/not, gc, apply cache
 └── tests/
-    ├── leb.rs                   — LEB128 roundtrips (5 tests)
-    ├── pair.rs                  — interleave/Minsky roundtrips (7 tests)
-    ├── node.rs                  — per-node encode/decode (3 tests)
-    ├── manager.rs               — manager basics, reduction, canonicity, ordering (8 tests)
-    ├── ite.rs                   — boolean op identities, node counts for small formulas (12 tests)
-    ├── gc.rs                    — copying GC preserves semantics, shrinks manager (5 tests)
-    ├── differential.rs          — shares tests across vwbdd and OxiDD, asserts node counts match (6 tests)
-    ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold (3 tests)
-    ├── mult.rs                  — x*y=z relation for k=2..8, node count + mem + post-GC accounting (1 test, internal sweep)
-    ├── mult_shared/mod.rs       — shared mult-relation builder, reused by mult.rs and edge_stats.rs
-    ├── microbench.rs            — decode cost, construction cost (2 tests)
-    ├── edge_stats.rs            — per-edge abs/rel/hybrid byte-cost measurement on mult k=2..8 (1 test, §4.4)
-    ├── timing.rs                — wall-clock comparison vs OxiDD on mult (1 test, k=4..8)
-    └── timing_large.rs          — large-k sweep, vwbdd vs OxiDD up to 30s budget (1 #[ignore]'d test, k=8..10+)
+    ├── leb.rs                   — LEB128 roundtrips
+    ├── node.rs                  — per-node encode/decode
+    ├── manager.rs               — manager basics, reduction, canonicity, ordering
+    ├── ite.rs                   — boolean op identities, node counts for small formulas
+    ├── gc.rs                    — copying GC preserves semantics, shrinks manager
+    ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
+    ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
+    ├── mult.rs                  — x*y=z relation for k=2..8, node count + mem + post-GC accounting
+    ├── mult_shared/mod.rs       — shared vwbdd+OxiDD ripple-adder mult builders, reused by timing.rs, timing_large.rs, mult.rs
+    ├── timing.rs                — wall-clock comparison vs OxiDD on mult (k=4..8)
+    └── timing_large.rs          — large-k sweep, vwbdd vs OxiDD up to 30 s budget (#[ignore]'d; k=8..11)
 ```
 
-Total: 54 tests, all green, full suite runs in ~3 s release.
+Total: 44 tests, all green (#[ignore]'d timing sweeps excluded).
 
