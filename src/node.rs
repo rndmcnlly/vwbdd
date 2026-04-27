@@ -1,18 +1,20 @@
 //! Node encoding backends.
 //!
 //! Three mutually exclusive encodings of `(var, lo, hi)` into the arena byte
-//! buffer are selectable via Cargo features:
+//! buffer are selectable via Cargo features. All assume `var < 256` (we never
+//! realistically run with more variables; at k=11 we use 44):
 //!
-//! - `encoding-interleaved` (default): LEB128(var); LEB128(interleave(lo_code, hi_code)).
-//!   The historical §4.2 layout. ~4.6 B/node at k=11.
+//! - `encoding-interleaved` (default):
+//!     [u8 var] LEB128(interleave(lo_code, hi_code))
+//!   The §4.2 layout with the §4.10 `var`-is-raw-u8 fast path.
 //!
-//! - `encoding-per-field`: LEB128(var); LEB128(lo_code); LEB128(hi_code).
-//!   Drops the interleave/deinterleave; three independent varints.
-//!   Trades a small byte-count loss for a simpler decode.
+//! - `encoding-per-field`:
+//!     [u8 var] LEB128(lo_code) LEB128(hi_code)
+//!   Three fields; no pair math. Same u8-var fast path.
 //!
-//! - `encoding-fixed`: repr-C struct of [u32; 3] = (var, lo_packed, hi_packed).
-//!   Fixed 12 B/node, no varint decode. Ceiling comparison: tells us how much
-//!   of our time the variable-width decode is actually costing.
+//! - `encoding-fixed`:
+//!     repr-C [u32; 3] = (var, lo_packed, hi_packed), 12 B/node total.
+//!   Ceiling comparison with no varint decode at all.
 //!
 //! Child reference encoding (`ref_to_code`/`code_to_ref`):
 //!   0                 -> false terminal
