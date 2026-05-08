@@ -864,6 +864,33 @@ The vocabulary also opens a door §4.14 hadn't: a "compute server" deployment pa
 Layer (3) minimization (actually shorten the wire) is probably not worth pursuing generally — graph bandwidth optimization is hard, and the 1% wiggle the mixed-case benchmark shows is small compared to the structural wins already measured. A worthwhile narrow version: during `gc_tail`, check whether the new layout actually reduces total encoded bytes before committing; if not, keep the old layout's surviving nodes in their original relative order. Preserves the clean-bytes invariant (dead nodes still get reclaimed) while sidestepping the re-encoding regression. Left as a follow-up with a known concrete motivation rather than speculation.
 
 
+### 4.16 The `vlen` crate: measured, rejected
+
+Someone will eventually notice `vlen` on crates.io — a modern variable-length-integer crate (MPL-2.0, ~600M integers/sec decode claimed, SIMD bulk path) — and propose replacing `src/leb.rs` with it. We did. The numbers didn't move.
+
+The shootout ran both codecs over all 928,362 child codes collected from a mult-trunc k=12 arena (464k nodes), encoding and decoding best-of-3 in release:
+
+| metric | LEB128 (ours) | vlen 0.3 | delta |
+|---|---:|---:|---:|
+| encoded size | 1,758,875 B | 1,758,875 B | **0% (byte-identical total)** |
+| encode | 2.59 ns/val | 3.00 ns/val | vlen 16% **slower** |
+| decode (scalar) | 1.96 ns/val | 1.49 ns/val | vlen 1.31× faster |
+
+Value-length distribution at this scale: 49% 1-byte, 12% 2-byte, 38% 3-byte, 0.2% 4-byte. Both codecs map these same four buckets to the same byte counts — the "equals or exceeds LEB128" compression claim is *equals*, not exceeds, in our value range.
+
+**Why the 60× decode-speed marketing number didn't show up.** The vlen README benchmarks a cold single-value Criterion loop against a generic `leb128` decoder. Our `src/leb.rs::decode_u128` is inlined at the call site, branch-predicted into the short-value case, and decoding u128 (the current signature) is slightly underselling itself — a u64 monomorphization would probably match vlen on the scalar path. The 1.31× remaining gap is two instructions per value at most and does not survive the hashmap probe and apply-cache lookup that sit around every real decode. Predicted wall-clock impact on mult: <2%.
+
+**And three integration costs went the other way:**
+
+1. **Padding invariant.** `vlen::decode::<u64>(buf)` requires `buf.len() ≥ 9`, regardless of the value being decoded. A packed arena has no such slack at the tail. Adopting vlen would require every `Slab` and `Diff` to carry 8 bytes of trailing slack as part of its contract, or every decode call site to bounds-check and fall back to a slow path when `remaining < 9`. Either way is load-bearing ergonomic tax that our current `decode_u128` doesn't pay.
+2. **MPL-2.0 dependency.** The README's "no runtime dependencies" stance is itself part of the story: a single-file-ish engine that costs nothing to absorb. MPL-2.0 is link-compatible with MIT but not the same covenant. Not a hard blocker; real posture change.
+3. **Wire-format break.** `vlen`'s byte layout is *not* LEB128 (unary length prefix in the low bits vs LEB's high-bit continuation). Every existing Slab would become unreadable. Pre-1.0 this costs a version bump, but it's a real compatibility floor to set.
+
+The decision recorded here is: **on our distribution, in our access pattern, with our wire contract, `vlen` is a lateral move at best.**
+
+The shootout harness isn't checked in (the measurement was taken once and the numbers were recorded; carrying a benchmark for a codec we didn't adopt is unjustified maintenance). To reproduce: add `vlen = "0.3"` as a dev-dep, collect child codes by scanning `m.arena_slice(0)` with `leb::decode_u128` after building a mult-trunc k=12 arena, and time best-of-3 encode/decode passes with both codecs. The distribution and ratios above are expected to be stable across machines; the absolute ns/value will vary. Revisit if (a) we move to substantially larger arenas where 5-byte+ child codes dominate, (b) vlen adds a streaming decoder that works on packed buffers without padding, or (c) we start shipping slabs in a context where CPU is the binding constraint (we're 3× slower than OxiDD right now; codec micro-wins aren't the lever).
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
