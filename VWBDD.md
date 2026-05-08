@@ -946,6 +946,31 @@ The positive deltas on lookup/cofactor/decode_node are not regressions; they're 
 **Reproducing the measurement.** An `examples/mult_trunc_k15.rs` binary in the tree produces the workload at a scale that fits a single Instruments recording. The whole loop from `cargo instruments -t time --release --example mult_trunc_k15` to a symbolized flat self-time histogram takes a couple of minutes on an M3 Max. Trace files land under `target/instruments/`; the export-to-XML + `atos` resolution steps used here are standard macOS sampling-profiler plumbing.
 
 
+### 4.18 Unique-table layout: SoA-with-narrow-tag is already local optimum
+
+§4.17 left `CompactUnique::lookup` at ~24% of wall time with the profile hinting that 82% of lookups miss the table outright (there's no existing node with this `(var, lo, hi)`). Plausible optimization: filter those misses cheaper by widening the hash tag, or by eliminating the separate tag array entirely via bit-packing into the slot u64.
+
+Both regressed. Measured on mult-trunc k=15 against the post-§4.17 baseline (9.7 s, 24.66 B/n total):
+
+| design | wall (ms) | total B/n | delta vs §4.17 |
+|---|---:|---:|---|
+| u8 tags (SoA), u64 offsets — baseline | 9,700 | 24.66 | — |
+| u16 tags (SoA), u64 offsets | 10,210 | 26.87 | +5% wall, +9% memory |
+| packed: u16 tag + 48-bit offset in one u64 (AoS) | 10,485 | 22.45 | +8% wall, −9% memory |
+
+**What actually matters in this probe path.** A linear-probe iter on a tag-filtered unique table, when tags don't match, touches **one tag byte per iter**. The 82% of calls that terminate within the first few iters (most without ever touching the arena) only load from the **tag array**, which at per-var-table scale is 200–300 KiB per table: L2-resident the whole time.
+
+Widening the tag to u16 doubled the bandwidth of that hot path. The tag-match FP rate dropped from ~1.8% to ~0.003%, saving ~700k arena decodes per k=15 run — maybe 15 ms in absolute terms — but the hot-path bandwidth cost was ~500 ms. Not worth it.
+
+Packing the tag into the slot u64 (one array instead of two) *sounds* better on cache-line footprint grounds, but it's 8× worse on per-iter bandwidth: the hot tag-scanning loop now reads 8 bytes per iter instead of 1. That dominated the savings from not having a separate array to prefetch. The memory win is real but comes out of the wrong cache level.
+
+**The design stays: `slots: Vec<u64>` + `tags: Vec<u8>` with 1-byte tag-array scanning.** The 1/256 hash-tag FPR occasionally costs a wasted arena decode, but those are rare (1.8% of lookups) and cheap in absolute terms (less than 10 ns amortized per call). The fraction of time `lookup` appears to take in the profile (24%) is not primarily the tag-array — it's the actual hash function + index computation + the arena decode when a real hit is confirmed.
+
+**Reproducing this rejection.** The two failed variants live in `git` as the working-tree experiments that immediately preceded this section (see the commit message referencing §4.18 for the snapshot commits). Both revert to master by inverting the noted edits in `src/unique.rs`.
+
+**General lesson.** When a profile fingers a function as a hotspot, the next move isn't "optimize that function" but "figure out why it's hot." The 24% on `lookup` decomposes into several distinct costs with distinct caches; optimizing the wrong one makes things worse. Further wins here would probably come from a structurally different approach (multi-slot bucketed tables, linked-list-per-bucket, etc.) rather than slot-layout microtuning.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
