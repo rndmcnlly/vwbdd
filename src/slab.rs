@@ -12,68 +12,34 @@
 //!
 //! The invariant is inductive: `ingest_slab(clean_base)` leaves the
 //! arena clean; `apply_diff(clean_base, clean_diff)` leaves it clean;
-//! GC-before-ship preserves it on output. The only way to introduce
-//! scratch is via construction ops (`make_node`, `ite`, `and`, …), and
-//! that scratch is invisible until the next `diff_since` / `slab_for`
-//! which cleans it out as part of emitting a public artifact.
+//! a call to [`Manager::gc`] before ship preserves it on output. The
+//! only way to introduce scratch is via construction ops; that scratch
+//! is invisible until the next `diff_since` / `slab_for`, which cleans
+//! it out as part of emitting a public artifact.
 //!
-//! The public operation that *actively* shrinks a live manager is
-//! [`Manager::drop_roots`] (alias for `gc`, intent-level name): "these
-//! are the roots I still care about; drop everything else."
+//! See VWBDD.md §4.15 for the three-levels-of-canonicity discussion
+//! (function-canonical vs layout-canonical vs layout-minimal) and the
+//! measurements that drove the invariant.
 //!
-//! ## Three levels of canonicity
+//! ## Types
 //!
-//! Worth naming explicitly because they come apart:
+//! - [`Slab`]: raw codec-encoded arena bytes plus a list of root
+//!   [`Ref`]s. The durable artifact; the unique table is an
+//!   ephemeral, private index rebuilt on demand.
 //!
-//! 1. **Function-canonical**: the DAG reachable from roots is the
-//!    reduced BDD for the function. Enforced cheaply by the unique
-//!    table. This is what the clean-bytes invariant delivers.
+//! - [`Diff`]: an append-only delta against a known base. Carries
+//!   only the tail bytes the recipient doesn't yet have plus new
+//!   roots; the recipient reconstructs the full arena by
+//!   concatenation. Position-independent: because every child code
+//!   is `2 + (cur − child)` (a backward delta), nodes appended on
+//!   top of a shared base encode to the same bytes regardless of
+//!   which process built them.
 //!
-//! 2. **Layout-canonical**: the byte encoding of that DAG depends only
-//!    on the DAG, not on construction history. *Not* guaranteed today.
-//!    A future `canonicalize_layout` pass (sort nodes by structural
-//!    hash, re-emit in that order) would give this.
-//!
-//! 3. **Layout-minimal**: byte encoding is as short as possible under
-//!    LEB128. Minimizing total `leb128_len(parent_offset − child_offset)`
-//!    is a bandwidth-minimization problem (NP-hard in general).
-//!
-//! The tail-GC benchmark in `tests/minor_gc_savings.rs` measured the
-//! gap between (2) and (3): compacting a tail by GC changed byte counts
-//! by ±1% on near-dense tails because the new layout's delta
-//! distribution crossed LEB128 boundaries differently.
-//!
-//! ## The vocabulary
-//!
-//! A compact slab (arena bytes + root refs) is the durable artifact;
-//! the unique table is an ephemeral, private index over it, rebuilt on
-//! demand.
-//!
-//! This file defines:
-//!
-//!   - [`Slab`]: raw codec-encoded arena bytes plus a list of root
-//!     [`Ref`]s that "export" something meaningful in those bytes.
-//!
-//!   - [`Diff`]: an append-only delta against a known base [`Slab`].
-//!     Carries only the tail bytes the recipient doesn't yet have plus
-//!     any new root refs; the recipient reconstructs the full arena by
-//!     concatenation. Relies on the LEB128 codec's position-independence
-//!     property: every child code is `2 + (cur − child)` (a backward
-//!     delta), so nodes appended on top of a base arena encode to the
-//!     same bytes regardless of who is doing the appending, as long as
-//!     everyone starts from the same base.
-//!
-//!   - Methods on [`Manager`] that tie it together:
-//!     [`Manager::ingest_slab`], [`Manager::slab_for`],
-//!     [`Manager::diff_since`], [`Manager::apply_diff`], and the
-//!     one-shot convenience [`Manager::extend_slab`].
-//!
-//! ## Example: the "extend" roundtrip
+//! ## Example: the extend roundtrip
 //!
 //! ```
 //! use vwbdd::{Manager, Slab};
 //!
-//! // Build a base slab with a single root.
 //! let base: Slab = {
 //!     let mut m = Manager::new();
 //!     let _ = m.new_var();
@@ -86,14 +52,13 @@
 //!     m.slab_for(&[and])
 //! };
 //!
-//! // "Server" side: ingest base, run ops, ship a diff back.
+//! // Server: ingest base, run ops, ship a diff back.
 //! let diff = Manager::extend_slab(&base, |m, base_roots| {
-//!     let and = base_roots[0];
-//!     let nand = m.not(and);
+//!     let nand = m.not(base_roots[0]);
 //!     vec![nand]
 //! });
 //!
-//! // "Client" side: ingest base, apply diff, now has both roots.
+//! // Client: ingest base, apply diff.
 //! let mut client = Manager::new();
 //! let _ = client.new_var();
 //! let _ = client.new_var();

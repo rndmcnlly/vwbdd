@@ -480,46 +480,30 @@ impl Manager {
     }
 
     /// **Generational garbage collector.** Frees unreachable bytes in
-    /// the *tail* of the arena (the region past `base_len`), leaving
-    /// the base bytes `[0..base_len)` untouched byte-for-byte. Call
-    /// with `base_len = 0` for a full collection (equivalent to
-    /// [`Self::drop_roots`]).
+    /// the tail of the arena (offsets `>= base_len`), leaving the base
+    /// bytes byte-for-byte untouched. Pass `base_len = 0` for a full
+    /// collection; [`Self::drop_roots`] is the ergonomic alias for
+    /// that. Used by [`Self::diff_since`](crate::slab) to enforce the
+    /// clean-bytes invariant on emitted diffs.
     ///
-    /// Used internally by [`Self::diff_since`](crate::slab) to enforce
-    /// the clean-bytes invariant on diffs it produces. Exposed publicly
-    /// for workloads that want to minor-GC without immediately producing
-    /// a diff.
+    /// No write barrier is needed: the LEB128 codec encodes children
+    /// as backward deltas, so a base node (offset `< base_len`) cannot
+    /// reference a tail node. Tail→base edges preserve absolute
+    /// offsets (delta encodings may shift).
     ///
-    /// **Why this works without a write barrier.** The LEB128 codec
-    /// encodes children as backward byte deltas: a node at offset `o`
-    /// can only reference children at offsets `< o`. So a base node
-    /// (offset `< base_len`) can never reference a tail node (offset
-    /// `>= base_len`). Tail→base references are fine and preserve their
-    /// absolute offsets (though delta encodings may shift).
+    /// Full-collection cost: one `buf.clone()` into `old_tail` before
+    /// re-encoding, a transient 2× memory blip. Tail-collection byte
+    /// savings measured on truncated-mult k=5..11:
     ///
-    /// **Full-collection cost.** At `base_len = 0` this clones the
-    /// entire arena once (into `old_tail`) before re-encoding. A
-    /// dedicated full-gc path could save that clone by building a
-    /// fresh `Vec<u8>` and swapping; we chose not to in favor of one
-    /// unified code path. For very large arenas with mostly-scratch
-    /// contents, that's a 2× memory blip during the call.
+    /// | tail shape                 | byte shrink        |
+    /// |----------------------------|--------------------|
+    /// | all scratch                | ∞ (tail → 0 B)     |
+    /// | mostly-live (~1% dead)     | ~0.99-1.04× (wash) |
+    /// | tiny result (1-2 nodes)    | ~1.6-1.75×         |
     ///
-    /// **Cost/benefit of tail-only collection** (measured in
-    /// `tests/minor_gc_savings.rs` on `trunc-mult` at k=5..11):
-    ///
-    /// | tail shape                    | byte shrink         |
-    /// |-------------------------------|---------------------|
-    /// | all scratch (→ terminals)     | ∞ (tail → 0 B)      |
-    /// | mostly-live (~1% dead)        | ~0.99-1.04× (wash)  |
-    /// | tiny result (~1-2 nodes)      | ~1.6-1.75×          |
-    ///
-    /// At very low dead-node fractions, re-encoding surviving nodes at
-    /// new (compacted) parent offsets can push LEB128 child-delta codes
-    /// across a 7-bit boundary, costing more bytes than the dead nodes
-    /// would have saved. Net negative by ~1% at k=11 when only 4 of
-    /// 3075 tail nodes were dead. Reach for tail-only GC when the
-    /// query is scratch-dominated; skip it when accumulating live
-    /// structure.
+    /// The near-dense wash is real: re-encoding surviving nodes at
+    /// compacted offsets can push LEB128 deltas across 7-bit
+    /// boundaries, costing more than the dead nodes saved.
     pub fn gc(&mut self, base_len: u64, roots: &[Ref]) -> Vec<Ref> {
         let buf_len = self.buf.len() as u64;
         assert!(

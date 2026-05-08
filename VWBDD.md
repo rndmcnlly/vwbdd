@@ -827,7 +827,7 @@ The write-barrier-free property is the interesting one. A generational GC in a c
 
 This isn't a pattern unique to BDDs. Any append-only, backward-referencing data structure (LEB128-encoded protobuf variants, log-structured key-value stores where references are always into older log entries, content-addressed stores where the address is a hash of preceding bytes) admits the same generational partitioning for the same reason. It's worth naming because most write-barrier engineering assumes the general case where mutations can go any direction.
 
-**The clean-bytes invariant.** `gc_tail` landed first as a user-facing tool: a power-user operation callers could reach for before shipping. Benchmarking (`tests/minor_gc_savings.rs`) and a user question ("shouldn't public data never contain garbage?") moved it a layer deeper. The resulting invariant:
+**The clean-bytes invariant.** `gc_tail` landed first as a user-facing tool: a power-user operation callers could reach for before shipping. Follow-up benchmarking and a user question ("shouldn't public data never contain garbage?") moved it a layer deeper. The resulting invariant:
 
 > Every `Slab`, `Diff`, and `.vwbdd` file that crosses a public boundary is function-canonical: running a GC on it would find nothing to remove.
 
@@ -927,7 +927,7 @@ vwbdd/
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
 │   ├── unique.rs                — CompactUnique: linear-probe unique table (u64 slots) (§4.7, §8)
 │   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15)
-│   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots (aliased to gc), gc_tail (minor-GC, §4.15), apply cache (§4.13)
+│   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots, gc (generational, §4.15), apply cache (§4.13)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
     ├── node.rs                  — per-node encode/decode
@@ -935,10 +935,8 @@ vwbdd/
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
     ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
-    ├── slab.rs                  — Slab/Diff roundtrips, extend_slab tail-only diffs, minor-GC (gc_tail) correctness, the clean-bytes invariant (§4.15)
-    ├── minor_gc_savings.rs      — benchmark: what the clean-bytes invariant costs at the wire, across simple/mixed/fat extend shapes (§4.15; #[ignore]'d)
+    ├── slab.rs                  — Slab/Diff roundtrips, extend_slab tail-only diffs, tail-GC correctness, the clean-bytes invariant (§4.15)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
-    ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
     ├── mult.rs                  — full x*y=z relation for k=2..8, node count + mem + post-GC accounting
     ├── mult_shared/mod.rs       — shared vwbdd+OxiDD builders: full-relation (2k-bit z) and truncated (k-bit z) variants
     ├── mult_trunc_correctness.rs— truncated (iota-style) node counts at small k (§4.13)
@@ -947,7 +945,7 @@ vwbdd/
     └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
 ```
 
-Total: 65 tests passing, 3 `#[ignore]`'d sweeps (two timing, one invariant-cost benchmark).
+Total: 62 tests passing, 2 `#[ignore]`'d timing sweeps.
 
 
 ## 8. The agility cut (what §4.12 and §4.14 gave and took back)

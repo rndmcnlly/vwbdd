@@ -233,9 +233,10 @@ fn apply_diff_detects_base_mismatch() {
 }
 
 #[test]
-fn extend_with_no_ops_produces_empty_tail() {
+fn empty_diff_roundtrips_cleanly() {
     // A degenerate but important case: if the server doesn't build
-    // anything new, the tail is zero bytes and no new roots.
+    // anything new, the tail is zero bytes and no new roots — and
+    // the client's arena is unchanged after apply_diff.
     let base = build_base();
 
     // Type-annotate the closure arg so type inference sees `Manager`
@@ -245,12 +246,6 @@ fn extend_with_no_ops_produces_empty_tail() {
     assert_eq!(diff.tail.len(), 0, "no ops, no tail");
     assert_eq!(diff.new_roots.len(), 0);
     assert_eq!(diff.base_len, base.bytes.len() as u64);
-}
-
-#[test]
-fn apply_empty_diff_is_noop() {
-    let base = build_base();
-    let diff: Diff = Manager::extend_slab(&base, |_m: &mut Manager, _base_roots| Vec::new());
 
     let mut client = Manager::new();
     let _ = client.new_var();
@@ -400,25 +395,6 @@ fn minor_gc_keeps_live_tail_nodes() {
         m.num_nodes(), reference.num_nodes(),
         "post-minor-GC node count equals the 'build from fresh' node count for the same kept roots"
     );
-}
-
-#[test]
-fn minor_gc_empty_tail_is_noop() {
-    // If the tail is already empty, minor GC should be a cheap no-op
-    // and return the roots unchanged.
-    let base = build_base();
-
-    let mut m = Manager::new();
-    let _ = m.new_var();
-    let _ = m.new_var();
-    let _ = m.new_var();
-    let base_roots = m.ingest_slab(&base);
-    let base_len = m.buf_len() as u64;
-    assert_eq!(base_len, m.buf_len() as u64);
-
-    let kept = m.gc(base_len, &base_roots);
-    assert_eq!(kept, base_roots);
-    assert_eq!(m.buf_len() as u64, base_len);
 }
 
 #[test]
