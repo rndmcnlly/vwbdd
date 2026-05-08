@@ -32,11 +32,13 @@ pub mod dump;
 pub mod leb;
 pub mod manager;
 pub mod node;
+pub mod slab;
 pub mod unique;
 
 pub use codec::{ArenaOffset, Leb128Codec, Node, NodeCodec, Ref};
 pub use dump::{DumpError, LoadedRoots};
 pub use manager::{Manager, ManagerConfig, MemStats, DEFAULT_ITE_CACHE_SLOTS};
+pub use slab::{Diff, Slab};
 
 /// Compact-arena manager: `u32` offsets, 4 GiB max, ~6.7 B/node unique table.
 /// Defaults-compatible alias so existing code written as `Manager` keeps working.

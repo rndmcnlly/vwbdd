@@ -20,10 +20,11 @@ Across the mult-relation `x*y=z` from k=2 to k=11 (reachable nodes 29 to 7.6M):
 - **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
 - **Total live memory (default build)**: **~15-16 B/node** (arena + unique table), plus a 2 MB fixed apply cache. Grand total at k=11: **~121 MB for 7.6M nodes**. About half of OxiDD's ~30-32 B/live-node.
 - **Wall-clock time**: **1.75× slower than OxiDD** at k=11 on the default build (§4.12 post-parameterization; the monomorphized u32 engine is 14-21% faster than the single-width u64 engine of §4.11).
+- **Generational storage API** (§4.15): `Slab` (arena bytes + roots) and `Diff` (tail-only delta against a known base) with a clean-bytes invariant — every public artifact is function-canonical, never carries ite scratch. The backward-delta codec makes minor GC write-barrier-free and tail bytes position-independent: any process starting from the same base produces bit-identical tail bytes for the same ops. Opens a "compute server" pattern where the client ships a base + ops, the server ships back the clean tail and drops its unique table.
 
 **Design trade-off, accepted explicitly**: within ~3× of OxiDD on runtime, at ~half OxiDD's total engine memory *and* unlimited-arena scaling when you need it. The §4.12 parameterization removed the prior either/or: no longer does the server-side build and the wasm-client build have to choose between compactness and capacity. The wasm client runs `DefaultManager` at 15-16 B/node with a 4 GiB arena ceiling; the server builds with `LargeManager` at ~25 B/node and can absorb up to ~40B live nodes in 1 TB of RAM. The serialized arena is codec-compatible across widths because `Leb128Codec` encodes the same bytes either way; the receiving engine just uses its own offset type to index them.
 
-Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design. §4.11 records the u32 → u64 widening that lifted the 4 GiB arena ceiling (but ran into footprint regression on small cases). §4.12 resolved that tension with a compile-time parameterization.
+Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design. §4.11 records the u32 → u64 widening that lifted the 4 GiB arena ceiling (but ran into footprint regression on small cases). §4.12 resolved that tension with a compile-time parameterization. §4.14 added multi-process partition-and-merge via dump/load/absorb. §4.15 unified those under Slab/Diff types, added minor GC, and made the clean-bytes invariant load-bearing — along the way surfacing a measurable gap between *function-canonical* (what the invariant delivers) and *byte-canonical* (what a content-addressable slab format would need).
 
 
 ## 1. Motivation
@@ -788,6 +789,79 @@ No threads, no locks, no shared memory primitives, no rayon dependency. Filesyst
 **The broader architectural claim.** Between §4.13 (tunable apply cache) and §4.14 (dump/load/absorb), vwbdd now offers the full "application developer drives policy, library provides mechanisms" stance across all three resource dimensions: memory (ManagerConfig), GC (manual, copying), and parallelism (manual, multi-process via absorb). The contrast with oxidd is sharp in this last dimension: oxidd shapes its multi-threaded design around a lock-free coordination protocol that's hard for the caller to opt out of; we offer no intra-manager parallelism at all, and trade that away for a merge primitive the application uses however it wants. Both are valid designs; they optimize for different caller philosophies.
 
 
+### 4.15 Slabs, diffs, and the clean-bytes invariant
+
+§4.14 introduced `dump`/`load`/`absorb` as three adjacent but separate operations. A later session pulled on the structural claim hiding under them and found: they are the same operation viewed from different sides. The artifact being shipped across process boundaries (a dumped arena byte stream plus its root list) deserves a name: **`Slab`**. The unique table that indexes those bytes is deliberately not part of it: ephemeral, rebuildable in O(n), private to whichever process holds the arena at that moment. The analogy the session walked in on, half-jokingly, was LLM tokens and KV caches: the arena is the token stream, the unique table is the KV cache, the arena boundary between one session's bytes and the next session's appended bytes is the prefix-vs-continuation split. The LLM analogy is imprecise but the partitioning it suggests is not.
+
+**The vocabulary, as shipped.**
+
+```rust
+struct Slab<O> { bytes: Vec<u8>, roots: Vec<Ref<O>> }
+struct Diff<O> { base_len: u64, tail: Vec<u8>, new_roots: Vec<Ref<O>> }
+
+impl Manager {
+    fn slab_for(&mut self, roots: &[Ref]) -> Slab;           // major-GC then snapshot
+    fn ingest_slab(&mut self, slab: &Slab) -> Vec<Ref>;      // load base into fresh manager
+    fn diff_since(&mut self, base_len: u64, new_roots: &[Ref]) -> Diff;
+    fn apply_diff(&mut self, diff: &Diff) -> Vec<Ref>;
+    fn extend_slab<F>(base: &Slab, ops: F) -> Diff;          // server-side convenience
+    fn drop_roots(&mut self, keep: &[Ref]) -> Vec<Ref>;      // alias for gc(keep)
+}
+```
+
+The pattern the types express: a server holds a base `Slab`, runs application-specific BDD construction on top, and ships back only a `Diff` (a tail of bytes the recipient appends to the base). Because the codec encodes children as *backward* byte deltas (`2 + cur - child`, see `src/codec.rs`), the appended tail is byte-identical regardless of which process built it, as long as everyone starts from the same base. That property — position-independence of the tail once the base boundary is fixed — is what makes the "ship the tail" protocol valid.
+
+**Generational GC, mostly for free.** Naming the base-vs-tail split exposes a correspondence that had been implicit in the append-only design:
+
+| generational GC concept | vwbdd analog |
+|---|---|
+| old generation | base bytes, `[0..base_len)` |
+| young generation | tail bytes, `[base_len..)` |
+| minor GC | `gc_tail(base_len, roots)`: walk only the tail, leave base untouched |
+| major GC | `drop_roots(keep)` / `gc`: rebuild the entire arena |
+| promotion | `slab_for(roots)` then ship: the whole promoted arena becomes a new base on the other side |
+| write barrier | **not needed** |
+| remembered set | **not needed** |
+
+The write-barrier-free property is the interesting one. A generational GC in a conventional language runtime needs to track old→young pointers so a minor collection doesn't miss references from survived objects in the old generation into the young one. Here, those references are syntactically impossible: child deltas are always backward (a node at offset *o* can only reference children at offsets < *o*), so a node built in the base at offset *b* < *base_len* cannot possibly point to a node in the tail at offset *t* ≥ *base_len*. Tail-to-base references are fine and must be preserved through minor GC (they're unchanged because the base doesn't move). Old→young would run backwards in encoding order, which the codec forbids. The partitioning is free; there's no mutator cooperation cost because there's no mutator — nodes are immutable once encoded.
+
+This isn't a pattern unique to BDDs. Any append-only, backward-referencing data structure (LEB128-encoded protobuf variants, log-structured key-value stores where references are always into older log entries, content-addressed stores where the address is a hash of preceding bytes) admits the same generational partitioning for the same reason. It's worth naming because most write-barrier engineering assumes the general case where mutations can go any direction.
+
+**The clean-bytes invariant.** `gc_tail` landed first as a user-facing tool: a power-user operation callers could reach for before shipping. Benchmarking (`tests/minor_gc_savings.rs`) and a user question ("shouldn't public data never contain garbage?") moved it a layer deeper. The resulting invariant:
+
+> Every `Slab`, `Diff`, and `.vwbdd` file that crosses a public boundary is function-canonical: running a GC on it would find nothing to remove.
+
+Every method that produces public bytes pre-GCs. `slab_for` calls `drop_roots` internally; `diff_since` calls `gc_tail` internally; `dump` (previously documented as "ship the whole arena, call gc first for compactness") now calls `drop_roots` internally. `gc_tail` is still exposed for workloads that want to reclaim scratch between ops without emitting a public artifact, but most callers never invoke it directly — the invariant runs it for them at the wire. The only *intent-level* shrinking operation visible to application code is `drop_roots(keep)`: "these are the roots I still care about; drop everything else."
+
+The invariant is inductive across the IPC boundary. Ingesting a clean Slab leaves the arena clean; applying a clean Diff to a clean base leaves it clean (append alone never introduces scratch); running internal ops then emitting another public artifact cleans out whatever scratch accumulated. A process never has to worry about whether *incoming* bytes are clean because producers guarantee it.
+
+**Three levels of canonicity, with measurements showing where they diverge.** The user was sharp enough to push back on the word "canonical": Slabs are function-canonical (the reduced DAG is unique for the function-plus-variable-order) but not *byte-canonical* (the exact encoding depends on which order nodes were built). That distinction sits on a three-level ladder:
+
+1. **Function-canonical.** The DAG reachable from roots is the reduced BDD. Cheap: the unique table enforces it.
+2. **Layout-canonical.** The byte encoding depends only on the DAG, not on construction history. Achievable via a post-GC pass that sorts nodes by structural hash and re-emits in that order. **Not shipped** — recorded as a gap.
+3. **Layout-minimal.** The encoding is as short as possible under LEB128. Minimizing `∑ leb128_len(parent_off − child_off)` is a graph-bandwidth problem, NP-hard in general.
+
+Properties (2) and (3) come apart in a measurable way. The minor-GC benchmark across trunc-mult k=5..11 with three extend shapes (simple / mixed / fat):
+
+| k | ops | tail nodes before→after GC | tail bytes before→after GC | byte ratio |
+|---|---|---|---|---|
+| 11 | simple | 2 → 1 | 8 → 5 | **1.60×** shrink |
+| 11 | mixed | 3075 → 3071 | 12212 → **12299** | **0.99×** (grew!) |
+| 11 | fat | 162538 → 0 | 736911 → 0 | **∞** shrink |
+
+The mixed row is the one the data is trying to show you. Four of 3075 tail nodes were dead. Reclaiming them saved maybe 15 bytes of node content. But compacting the survivors to the new offsets shifted ~3000 backward deltas, and some of them crossed a LEB128 7-bit boundary in the wrong direction (a parent moved closer, meaning its delta into a base child *grew*, pushing that delta from a 1-byte encoding into a 2-byte one; or vice versa with offsetting sign). Net effect: 87 bytes larger after the "optimization." The canonical layout produced by `gc_tail` is not byte-minimal; it's just a valid layout.
+
+That number is the honest architectural statement the session ended on. For the scratch-dominated case (fat ops, tautology queries) the invariant saves essentially everything: 737 KB of ite intermediates collapse to 0 bytes shipped. For the scratch-free case (simple ops) it saves a couple of bytes of overhead. For the nearly-dense case (mixed ops with small dead fraction) it occasionally costs a small amount due to the LEB128 jitter. The library makes the call unconditionally because predictability (clean bytes always) is worth more than the occasional hundred-byte regression, and because workloads that matter — long-running symbolic computation where the client asks a series of questions against a held base — are scratch-heavy, not near-dense.
+
+**Why this mattered to the session.** Setting the clean-bytes invariant turned the public API from a menu of weakly-coupled primitives (here's `gc`, here's `dump`, here's `absorb`, good luck) into a small generational vocabulary with a load-bearing property the caller can rely on. The before-and-after shape of "please run `gc(roots)` before `dump` for compactness" versus "`dump` is clean by construction" is the same shape as any well-designed library: the invariant pushes down into the library so callers don't have to remember it.
+
+The vocabulary also opens a door §4.14 hadn't: a "compute server" deployment pattern. Client posts a base Slab (or a hash thereof pointing to one the server already holds) plus an operation script; server ingests the base, runs the ops, emits a clean Diff; server drops its unique table and exits. No persistent state, horizontally scalable, and the shipping unit is exactly the bytes that changed. That's what motivated the session, and what the types now express directly. An actual HTTP surface for this is left to a later session; the primitive is in place.
+
+**What's not yet done.** Layer (2) canonicity (content-addressable slabs where byte-identical output is guaranteed for structurally identical DAGs) would be the obvious next step if anyone wants to cache slabs by hash or dedupe them on a server. It's a standalone pass on top of GC: sort reachable nodes by a structural hash rolled up from terminals to roots, emit in that order. Tests in `tests/slab.rs` cover the invariant; a future `tests/canonical_layout.rs` would cover byte-identity under permuted construction histories.
+
+Layer (3) minimization (actually shorten the wire) is probably not worth pursuing generally — graph bandwidth optimization is hard, and the 1% wiggle the mixed-case benchmark shows is small compared to the structural wins already measured. A worthwhile narrow version: during `gc_tail`, check whether the new layout actually reduces total encoded bytes before committing; if not, keep the old layout's surviving nodes in their original relative order. Preserves the clean-bytes invariant (dead nodes still get reclaimed) while sidestepping the re-encoding regression. Left as a follow-up with a known concrete motivation rather than speculation.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -852,8 +926,9 @@ vwbdd/
 │   ├── codec.rs                 — ArenaOffset + NodeCodec traits; Leb128Codec impl (§4.12)
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
 │   ├── unique.rs                — CompactUnique<C, O>: linear-probe, generic slot width (§4.7)
-│   ├── dump.rs                  — .vwbdd native format: dump/load/absorb multi-root with CRC32 (§4.14)
-│   └── manager.rs               — live engine: Manager<C, O>, ManagerConfig, make_node, ite, and/or/xor/not, gc, apply cache (§4.13)
+│   ├── dump.rs                  — .vwbdd native format: dump/load/absorb multi-root with CRC32 (§4.14); dump/dump_named now pre-GC to enforce the clean-bytes invariant (§4.15)
+│   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15)
+│   └── manager.rs               — live engine: Manager<C, O>, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots (aliased to gc), gc_tail (minor-GC, §4.15), apply cache (§4.13)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
     ├── node.rs                  — per-node encode/decode (default u32)
@@ -861,7 +936,9 @@ vwbdd/
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
     ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
-    ├── dump.rs                  — .vwbdd roundtrip: single/multi-root, named, absorb dedup, error paths (§4.14)
+    ├── dump.rs                  — .vwbdd roundtrip: single/multi-root, named, absorb dedup, error paths (§4.14), clean-bytes invariant on dump (§4.15)
+    ├── slab.rs                  — Slab/Diff roundtrips, extend_slab tail-only diffs, minor-GC (gc_tail) correctness, the clean-bytes invariant (§4.15)
+    ├── minor_gc_savings.rs      — benchmark: what the clean-bytes invariant costs at the wire, across simple/mixed/fat extend shapes (§4.15; #[ignore]'d)
     ├── large_manager.rs         — LargeManager smoke + u32/u64 cross-width agreement (§4.12)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
@@ -873,5 +950,5 @@ vwbdd/
     └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
 ```
 
-Total: 65 tests passing, 3 #[ignore]'d timing sweeps.
+Total: 78 tests passing, 4 #[ignore]'d sweeps (three timing, one invariant-cost benchmark).
 

@@ -55,23 +55,40 @@ fn single_root_roundtrip() {
     let before_nodes = m1.num_nodes();
     let before_buf_len = m1.buf_len();
 
+    // Separately, compute the reachable-from-root node count and the
+    // byte size those nodes take. Under the clean-bytes invariant,
+    // `dump` pre-GCs to the declared roots, so the dumped file holds
+    // exactly this cleaned-down subset — not the full construction
+    // history.
+    let mut m_reference = Manager::new();
+    let r_ref = build_formula(&mut m_reference);
+    let _ = m_reference.drop_roots(&[r_ref]);
+    let cleaned_nodes = m_reference.num_nodes();
+    let cleaned_buf_len = m_reference.buf_len();
+    assert!(
+        cleaned_nodes <= before_nodes,
+        "cleaned ({}) should be ≤ raw ({})",
+        cleaned_nodes, before_nodes
+    );
+
     m1.dump(&path, &[r]).expect("dump");
 
     let (m2, loaded) = Manager::load(&path).expect("load");
     assert_eq!(loaded.roots.len(), 1, "single root survived roundtrip");
     assert!(loaded.names.is_none(), "no names dumped → no names loaded");
 
-    // The arena is a byte-for-byte copy; node count and buf_len should match.
+    // Loaded manager holds the cleaned subset, not the full history.
     assert_eq!(
-        m2.num_nodes(),
-        before_nodes,
-        "node count survived (arena canonical)"
+        m2.num_nodes(), cleaned_nodes,
+        "dumped file contained the function-canonical subset: {} nodes (not the {} nodes \
+         that existed in the manager's arena before dump)",
+        cleaned_nodes, before_nodes
     );
-    assert_eq!(
-        m2.buf_len(),
-        before_buf_len,
-        "arena byte length survived"
-    );
+    assert_eq!(m2.buf_len(), cleaned_buf_len);
+    // m1 itself was also cleaned by dump (it ran drop_roots internally).
+    assert_eq!(m1.num_nodes(), cleaned_nodes);
+    assert_eq!(m1.buf_len(), cleaned_buf_len);
+    let _ = before_buf_len; // retained for documentation
 
     // Root should decode as a Node ref pointing into the loaded arena.
     assert!(

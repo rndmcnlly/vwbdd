@@ -213,30 +213,37 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
     /// Dump the manager's reachable-from-roots subset to a file in the
     /// native vwbdd binary format. Named roots are not written.
     ///
-    /// Implementation shortcut: we dump the *entire* arena, not just the
-    /// reachable subset. If you want the dump to be as compact as
-    /// possible, call `gc(roots)` first so the arena contains only live
-    /// nodes. After a fresh build with no intermediate GC, the arena may
-    /// contain many dead intermediate nodes that will be pointlessly
-    /// included in the dump.
-    pub fn dump(&self, path: impl AsRef<Path>, roots: &[Ref<O>]) -> Result<(), DumpError> {
-        self.dump_inner(path.as_ref(), roots, None)
+    /// **Clean-bytes invariant**: the dumped file is function-canonical
+    /// for the declared roots. Internally runs `drop_roots(roots)`
+    /// before writing so the file contains no scratch. This mutates
+    /// the manager (same side effects as `drop_roots`); clone first if
+    /// you need to preserve state.
+    ///
+    /// Prior versions of this method dumped the entire arena verbatim
+    /// and asked the caller to `gc` first for compactness. That
+    /// exposed dirty bytes across the public (file) boundary and is
+    /// no longer done: all publicly-observable vwbdd artifacts are
+    /// clean by construction.
+    pub fn dump(&mut self, path: impl AsRef<Path>, roots: &[Ref<O>]) -> Result<(), DumpError> {
+        let cleaned = self.drop_roots(roots);
+        self.dump_inner(path.as_ref(), &cleaned, None)
     }
 
     /// Dump with per-root names. Names are UTF-8 strings; the loader
     /// returns them in the same order as the root list. Useful for
     /// transition-system artifacts that want to preserve `init`, `trans`,
     /// etc. as first-class labels across dump/load.
+    ///
+    /// Same clean-bytes invariant as [`Self::dump`].
     pub fn dump_named<S: AsRef<str>>(
-        &self,
+        &mut self,
         path: impl AsRef<Path>,
         roots_and_names: &[(Ref<O>, S)],
     ) -> Result<(), DumpError> {
-        let (roots, names): (Vec<_>, Vec<_>) = roots_and_names
-            .iter()
-            .map(|(r, n)| (*r, n.as_ref()))
-            .unzip();
-        self.dump_inner(path.as_ref(), &roots, Some(&names))
+        let roots: Vec<Ref<O>> = roots_and_names.iter().map(|(r, _)| *r).collect();
+        let names: Vec<&str> = roots_and_names.iter().map(|(_, n)| n.as_ref()).collect();
+        let cleaned = self.drop_roots(&roots);
+        self.dump_inner(path.as_ref(), &cleaned, Some(&names))
     }
 
     fn dump_inner(

@@ -503,10 +503,37 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
         self.ite(f, ng, g)
     }
 
+    /// **Drop everything except these roots.** Major garbage collection:
+    /// replaces the arena with a fresh one containing only the closure
+    /// of `keep`, returning the translated roots.
+    ///
+    /// This is the only public operation that shrinks a manager. The
+    /// invariant it supports: after `drop_roots`, running a GC again
+    /// would find nothing to remove — the arena is *function-canonical*
+    /// for the given roots, carrying no scratch from prior operations.
+    /// (Not *layout-canonical*: node construction order during ops
+    /// determined the current byte layout, which `drop_roots` preserves
+    /// in relative order but compacts. Two managers that built the same
+    /// BDD via different op sequences can produce different byte
+    /// encodings of the same canonical DAG. See VWBDD.md's discussion
+    /// of the three canonicity levels.)
+    ///
+    /// Replaces the older name [`Self::gc`] at the caller's level of
+    /// abstraction: `drop_roots` names the *intent* (these are the
+    /// roots I still care about), while `gc` names the *mechanism*.
+    /// Both are public; callers should prefer `drop_roots` for new
+    /// code. The apply cache is flushed as a side effect.
+    pub fn drop_roots(&mut self, keep: &[Ref<O>]) -> Vec<Ref<O>> {
+        self.gc(keep)
+    }
+
     /// Copying garbage collector. Takes a slice of roots, builds a fresh arena
     /// containing only the nodes reachable from those roots, and returns the
     /// remapped roots. The apply cache is flushed; callers must replace their
     /// own held refs with the returned ones.
+    ///
+    /// Mechanism-level name; see [`Self::drop_roots`] for the intent-level
+    /// name recommended for new code.
     pub fn gc(&mut self, roots: &[Ref<O>]) -> Vec<Ref<O>> {
         let mut remap: HashMap<u64, Ref<O>> = HashMap::new();
         let mut new_buf: Vec<u8> = Vec::new();
@@ -574,6 +601,232 @@ impl<C: NodeCodec<O>, O: ArenaOffset> Manager<C, O> {
         roots.iter().map(|&r| translate::<O>(&remap, r)).collect()
     }
 
+    /// **Minor (tail-only) garbage collection.** Frees unreachable bytes
+    /// in the *tail* of the arena (the region past `base_len`), leaving
+    /// the base bytes `[0..base_len)` untouched byte-for-byte.
+    ///
+    /// **Most callers don't need this directly.**
+    /// [`Manager::diff_since`](crate::slab) runs `gc_tail` internally
+    /// to enforce the clean-bytes invariant on diffs it produces. This
+    /// method is exposed for workloads that want to minor-GC without
+    /// immediately producing a diff (e.g., long-running queries that
+    /// accumulate scratch across many ops and periodically want to
+    /// reclaim it without a full major GC).
+    ///
+    /// This is the generational counterpart to [`Self::gc`]. Where
+    /// `gc` is a major collection that rebuilds the entire arena,
+    /// `gc_tail` touches only the young generation: nodes built since
+    /// we last "promoted" a base. The base/tail boundary is a parameter;
+    /// the typical value comes from recording `m.buf_len()` right after
+    /// [`Self::ingest_slab`] (see `src/slab.rs`).
+    ///
+    /// **Why this works without a write barrier.** A generational GC
+    /// usually needs a remembered set to track old→young pointers. We
+    /// don't, because the LEB128 codec encodes children as backward
+    /// byte deltas: a node at offset `o` can only reference children
+    /// at offsets `< o`. So a base node (offset `< base_len`) can never
+    /// reference a tail node (offset `>= base_len`) — the direction is
+    /// syntactically forbidden. Tail→base references, on the other
+    /// hand, are fine and must be preserved verbatim: the base doesn't
+    /// move, so a tail-to-base child keeps the same absolute offset
+    /// (though its backward-delta encoding will change because the
+    /// *parent* offset may have shifted after compaction).
+    ///
+    /// **Roots handling.** `roots` may contain terminals, base nodes,
+    /// or tail nodes. Terminals and base-node roots pass through
+    /// unchanged. Tail-node roots get remapped to their new tail
+    /// offsets.
+    ///
+    /// **What you get back.** The returned vector is `roots` translated
+    /// through the remap. After this call, `self.buf_len()` is typically
+    /// `<` the pre-call value (tail shrank); `base_len` is unchanged.
+    /// A subsequent `diff_since(base_len, translated_roots)` produces
+    /// the minimum shippable diff for those roots — this is the natural
+    /// pre-ship optimization pass.
+    ///
+    /// **Cost.** O(live tail nodes) for the walk + rebuild. The unique
+    /// table is rebuilt from the *full* arena (base + new tail) because
+    /// the base nodes' slots were fine but the tail nodes got new
+    /// offsets; simplest correct option, and base nodes re-insert with
+    /// the same hash-to-slot mapping they had before (deterministic
+    /// splitmix). A future refinement could preserve the base's unique
+    /// table entries and only reinsert tail entries; left for a
+    /// profile-driven session.
+    ///
+    /// **When this wins and when it doesn't** (measured in
+    /// `tests/minor_gc_savings.rs` on `trunc-mult` at k=5..11):
+    ///
+    /// | tail shape                              | byte shrink      |
+    /// |-----------------------------------------|------------------|
+    /// | all scratch (query folds to terminals)  | ∞ (tail → 0 B)   |
+    /// | mostly-live (~1% dead)                  | ~0.99-1.04× (wash)|
+    /// | tiny result (~1-2 nodes)                | ~1.6-1.75×       |
+    ///
+    /// The surprise: at very low dead-node fractions, re-encoding
+    /// surviving nodes at their new (compacted) parent offsets can
+    /// push a handful of LEB128 child-delta codes across a 7-bit
+    /// boundary, costing more bytes than the dead nodes would have
+    /// saved. Net negative by ~1% at k=11 when only 4 of 3075 tail
+    /// nodes were dead. The call is therefore a *choice the caller
+    /// makes* based on knowledge of the ops: reach for it when you
+    /// know the query is scratch-dominated (model-counting-style
+    /// questions, satisfiability probes), skip it when you're
+    /// accumulating live structure.
+    pub fn gc_tail(&mut self, base_len: u64, roots: &[Ref<O>]) -> Vec<Ref<O>> {
+        let buf_len = self.buf.len() as u64;
+        assert!(
+            base_len <= buf_len,
+            "gc_tail: base_len {} > arena len {}",
+            base_len, buf_len
+        );
+        if base_len == buf_len {
+            // Nothing to collect; tail is empty. Still translate roots
+            // (they must all be terminals or base nodes).
+            return roots.to_vec();
+        }
+
+        // remap: tail-offset (u64) → new Ref<O>. Terminals and base
+        // nodes are NOT stored here; they pass through translate_young.
+        let mut remap: HashMap<u64, Ref<O>> = HashMap::new();
+
+        // Strategy: snapshot the old tail bytes, truncate `self.buf`
+        // to `base_len`, then re-encode surviving tail nodes directly
+        // into `self.buf`. This satisfies the codec's invariant
+        // (out.len() == current_offset at encode time) without having
+        // to pre-fill a scratch buffer.
+        let old_tail: Vec<u8> = self.buf[base_len as usize..].to_vec();
+
+        enum Frame<O: ArenaOffset> {
+            Enter(O),
+            Exit(O),
+        }
+
+        // Helper: is this offset in the young generation?
+        let is_young = |o: u64| -> bool { o >= base_len };
+
+        // Walk each root over the OLD arena bytes. We keep a separate
+        // closure over the full old buffer (base + old_tail) by
+        // concatenating base bytes (still in self.buf up to base_len)
+        // with old_tail — but actually we can just read directly from
+        // self.buf.as_slice() BEFORE truncation. Do the walk first,
+        // collect the post-order list of surviving offsets, then
+        // truncate and re-encode.
+        let mut post_order: Vec<O> = Vec::new();
+        {
+            let old_buf = &self.buf;
+            for &root in roots {
+                if let Ref::Node(off) = root {
+                    let ov = off.to_u64();
+                    if !is_young(ov) {
+                        continue; // base root; nothing to do
+                    }
+                    if remap.contains_key(&ov) {
+                        continue;
+                    }
+                    let mut stack: Vec<Frame<O>> = vec![Frame::Enter(off)];
+                    while let Some(frame) = stack.pop() {
+                        match frame {
+                            Frame::Enter(o) => {
+                                let ov = o.to_u64();
+                                if remap.contains_key(&ov) { continue; }
+                                // Sentinel: mark we're walking this
+                                // node. We'll fill in remap at Exit.
+                                // Use a placeholder to avoid
+                                // re-enqueueing; simplest is to check
+                                // a separate "seen" set. Reuse remap
+                                // with a temporary sentinel doesn't
+                                // work because we need the real value
+                                // at Exit. Use a small visited set.
+                                debug_assert!(is_young(ov));
+                                let (node, _) = C::decode(&old_buf[ov as usize..], o);
+                                stack.push(Frame::Exit(o));
+                                if let Ref::Node(lo_off) = node.lo {
+                                    let lv = lo_off.to_u64();
+                                    if is_young(lv) && !remap.contains_key(&lv) {
+                                        stack.push(Frame::Enter(lo_off));
+                                    }
+                                }
+                                if let Ref::Node(hi_off) = node.hi {
+                                    let hv = hi_off.to_u64();
+                                    if is_young(hv) && !remap.contains_key(&hv) {
+                                        stack.push(Frame::Enter(hi_off));
+                                    }
+                                }
+                            }
+                            Frame::Exit(o) => {
+                                let ov = o.to_u64();
+                                if remap.contains_key(&ov) { continue; }
+                                // Mark seen by inserting a placeholder;
+                                // we'll overwrite with the real new ref
+                                // after re-encoding below.
+                                remap.insert(ov, Ref::Terminal(false));
+                                post_order.push(o);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now truncate the buffer to just the base, and re-encode
+        // surviving tail nodes directly into it.
+        //
+        // We need to decode children from the OLD tail bytes (which
+        // we just snapshotted into `old_tail`) — the self.buf tail
+        // region will be progressively rewritten as we go, so we can't
+        // decode from it. Base children are at offsets < base_len and
+        // remain in self.buf untouched.
+        self.buf.truncate(base_len as usize);
+
+        // Clear the placeholder entries so translate_young's lookup
+        // gets the real values we're about to insert.
+        remap.clear();
+
+        // Re-walk post_order (already in topological Exit order) and
+        // encode. Decode each node's original children from old_tail
+        // (for young children) or from self.buf (for base children,
+        // though we only need them via translate_young which is
+        // identity on base).
+        for old_off in post_order {
+            let ov = old_off.to_u64();
+            // Read the node from old_tail. Offset within old_tail is
+            // (ov - base_len).
+            let tail_rel = (ov - base_len) as usize;
+            let (node, _) = C::decode(&old_tail[tail_rel..], old_off);
+            let new_lo = translate_young::<O>(&remap, node.lo, base_len);
+            let new_hi = translate_young::<O>(&remap, node.hi, base_len);
+            let new_ref = if new_lo == new_hi {
+                new_lo
+            } else {
+                let new_off = O::from_u64(self.buf.len() as u64);
+                C::encode(node.var, new_lo, new_hi, new_off, &mut self.buf);
+                Ref::Node(new_off)
+            };
+            remap.insert(ov, new_ref);
+        }
+
+        // Rebuild the unique table over the full arena. Both base and
+        // tail entries get reinserted; the base-hashes are deterministic
+        // under splitmix, so nothing changes for them structurally — but
+        // we still have to refill the table because we don't have a
+        // per-generation unique-table today.
+        self.unique_rebuild_from_arena();
+
+        // Flush apply cache: any entry that referenced a stale tail
+        // offset would now resolve to a different node. Conservative
+        // choice; base-only entries would technically survive but we
+        // don't distinguish them.
+        for e in self.ite_cache.iter_mut() {
+            *e = IteCacheEntry::empty();
+        }
+        self.ite_cache_len = 0;
+
+        // Translate roots for the caller.
+        roots.iter()
+            .map(|&r| translate_young::<O>(&remap, r, base_len))
+            .collect()
+    }
+
     /// Rebuild the unique table by scanning the current arena in construction
     /// order. Called after GC, which overwrites `self.buf` with a fresh arena.
     fn unique_rebuild_from_arena(&mut self) {
@@ -603,6 +856,30 @@ fn translate<O: ArenaOffset>(remap: &HashMap<u64, Ref<O>>, r: Ref<O>) -> Ref<O> 
     match r {
         Ref::Terminal(_) => r,
         Ref::Node(off) => *remap.get(&off.to_u64()).expect("root unreachable in remap"),
+    }
+}
+
+/// Minor-GC variant of [`translate`]: base-generation node refs pass
+/// through unchanged (they weren't walked, so they aren't in the remap),
+/// young-generation refs go through the remap.
+fn translate_young<O: ArenaOffset>(
+    remap: &HashMap<u64, Ref<O>>,
+    r: Ref<O>,
+    base_len: u64,
+) -> Ref<O> {
+    match r {
+        Ref::Terminal(_) => r,
+        Ref::Node(off) => {
+            let ov = off.to_u64();
+            if ov < base_len {
+                // Base node: identity.
+                r
+            } else {
+                // Young node: must be in the remap because we walked
+                // every reachable tail node.
+                *remap.get(&ov).expect("young root unreachable in minor-GC remap")
+            }
+        }
     }
 }
 
