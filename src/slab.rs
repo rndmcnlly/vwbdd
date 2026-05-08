@@ -68,7 +68,9 @@
 //! assert_eq!(new_roots.len(), 1);
 //! ```
 
-use crate::codec::{decode_node, Ref};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use crate::codec::{decode_node, Node, Ref};
 use crate::manager::Manager;
 
 /// A compact shipping unit: the arena bytes and the exported root refs.
@@ -94,6 +96,77 @@ impl Slab {
     /// `base_len` boundary when applying any later [`Diff`].
     pub fn base_len(&self) -> u64 {
         self.bytes.len() as u64
+    }
+
+    /// Decode the node whose header starts at byte offset `off`.
+    /// A clean slab's refs always land on valid node headers.
+    #[inline]
+    fn node_at(&self, off: u64) -> Node {
+        let (node, _consumed) = decode_node(&self.bytes[off as usize..], off);
+        node
+    }
+
+    /// The set of variables that `root` actually branches on.
+    ///
+    /// Read-only DFS over the reachable subgraph: no unique table or
+    /// manager required. Runs in O(|reachable nodes|) via a visited
+    /// memo so shared subDAGs are walked once.
+    pub fn support(&self, root: Ref) -> BTreeSet<u32> {
+        let mut out = BTreeSet::new();
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut stack: Vec<u64> = Vec::new();
+        if let Ref::Node(off) = root {
+            stack.push(off);
+        }
+        while let Some(off) = stack.pop() {
+            if !visited.insert(off) {
+                continue;
+            }
+            let n = self.node_at(off);
+            out.insert(n.var);
+            if let Ref::Node(lo) = n.lo {
+                stack.push(lo);
+            }
+            if let Ref::Node(hi) = n.hi {
+                stack.push(hi);
+            }
+        }
+        out
+    }
+
+    /// Number of satisfying assignments of `root` over `{0,1}^nvars`.
+    ///
+    /// Variables not branched on each contribute a factor of 2, so the
+    /// count is invariant under variable order and interleaving: it's
+    /// a property of the function, not the BDD shape. Result is `f64`
+    /// (exact up to 2^53).
+    ///
+    /// Implemented via fractional counts: each node memoizes "fraction
+    /// of the sub-cube below me that satisfies", in `[0, 1]`. Skipped
+    /// levels are free because a child that doesn't mention a variable
+    /// has the same fraction regardless of its value.
+    pub fn sat_count(&self, root: Ref, nvars: u32) -> f64 {
+        let mut memo: HashMap<u64, f64> = HashMap::new();
+        let frac = self.sat_frac(root, &mut memo);
+        frac * (1u64 << nvars) as f64
+    }
+
+    fn sat_frac(&self, r: Ref, memo: &mut HashMap<u64, f64>) -> f64 {
+        match r {
+            Ref::Terminal(false) => 0.0,
+            Ref::Terminal(true) => 1.0,
+            Ref::Node(off) => {
+                if let Some(&c) = memo.get(&off) {
+                    return c;
+                }
+                let n = self.node_at(off);
+                let lo = self.sat_frac(n.lo, memo);
+                let hi = self.sat_frac(n.hi, memo);
+                let c = 0.5 * lo + 0.5 * hi;
+                memo.insert(off, c);
+                c
+            }
+        }
     }
 }
 
