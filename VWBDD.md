@@ -1039,6 +1039,46 @@ Three things jump out.
 **Kept in the tree.** `examples/apply_cache_sweep.rs` produces this table in ~2 minutes on an M3 Max. Unlike the §4.18 and §4.19 throwaway harnesses, this one has ongoing diagnostic value: any future change to hash, cache policy, or apply algorithm should re-run the sweep to check the 49.5% ceiling moves. The counters themselves are exposed via `apply_cache_stats_{enable,reset,stats}` in the public API; enable-gate is a single branch predictor-friendly atomic bool, off by default, zero effect on non-instrumented workloads.
 
 
+### 4.21 ITE-key canonicalization: the swaps don't fire on mult
+
+§4.20 found that 50% of `ite_cache_get` calls query novel `(f,g,h)` triples. The suggested structural lever was canonicalization: rewrite semantically-equal ite arguments to a canonical form *before* cache lookup, so commutatively-equivalent calls share a cache slot.
+
+**What we tried.** Commutativity on AND and OR, the two cases that don't require complement edges:
+
+- `ite(f, g, ⊥) = f ∧ g = ite(g, f, ⊥)`: canonicalize by sorting `(f, g)` so the smaller `ref_to_u64` comes first.
+- `ite(f, ⊤, h) = f ∨ h = ite(h, ⊤, f)`: same sort on `(f, h)`.
+- NOT (`ite(f, ⊥, ⊤)`) is already canonical. Three-way ite has no cheap canonicalization without complement edges.
+
+**Pattern distribution** (from `apply_cache_patterns` at k=15):
+- AND: 65.1%
+- OR: 5.5%
+- NOT: 7.6%
+- OTHER (arbitrary three-way ite): 21.7%
+
+So the swaps target 70.6% of calls. The upper-bound estimate: if the reverse-ordered forms of every AND/OR call were eventually computed, canonicalization would fold pairs into single cache slots.
+
+**What measured.** At k=15 mult-trunc:
+
+| metric | before | after | delta |
+|---|---:|---:|---:|
+| wall | 9,915 ms | 10,295 ms | **+4% regression** |
+| hit rate | 49.6% | 49.6% | **0** |
+| collision-miss rate | 47.5% | 47.5% | 0 |
+| call count | 72.43M | 72.42M | noise |
+
+The canonicalization was silently correct (all 70 tests pass; reachable node count identical at 10,304,528) but achieved nothing. The hit rate didn't move by a tenth of a percent, and the comparison overhead on every call cost 4% wall time.
+
+**Why.** The workload never presents both `ite(a, b, ⊥)` and `ite(b, a, ⊥)` for the same pair. The ripple-carry mult builder calls `and(x[i], y[j])` in a consistent order; `xor` is built as `ite(a, not(b), b)`, which is asymmetric by design; and recursive cofactor expansion produces deterministic per-site orderings. The canonicalization is mathematically correct but **the access pattern just doesn't generate the commuted twin** of any given call.
+
+Phrased differently: the §4.20 "50% novel triples" finding already implied this. If half the `ite` calls are genuinely new keys, swapping operands doesn't help unless the other key for the same function already exists in cache. For mult, the other key simply never gets computed.
+
+**What would work, for the record.** Workloads with richer redundancy patterns (model-checking fixpoints, Boolean satisfiability counting, anything with symmetric recursion across DAG layers) might see hit-rate lift from the same canonicalization. We don't have a native workload of that shape in the tree, so this is a reasoned extrapolation rather than a measurement.
+
+**What we kept.** The instrumentation — `apply_cache_patterns()` — is genuinely useful and stays. It gives the AND/OR/NOT/OTHER breakdown in one function call, which any future canonicalization design should consult first. The `canonicalize_ite_key` helper itself is reverted; no call site in the library uses it. Re-apply by wrapping `ite_cache_get` and `ite_cache_put` with a call to the helper; the diff is ~20 lines.
+
+**General lesson** (joining §4.18 and §4.19). "A canonicalization folds keys into fewer slots" is a correctness statement, not a measurement. Whether the fold saves real work depends on the *access trace*, specifically whether pre- and post-canonical forms both occur close enough in time to share a cache slot. For mult, they don't. The pattern distribution (which is cheap to collect) is the right thing to look at before committing to a canonicalization; the distribution being AND-dominated doesn't imply the workload sees AND-argument-swap redundancy.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:

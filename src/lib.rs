@@ -26,5 +26,5 @@ pub mod slab;
 pub mod unique;
 
 pub use codec::{Node, Ref};
-pub use manager::{Manager, ManagerConfig, MemStats, DEFAULT_ITE_CACHE_SLOTS, apply_cache_stats, apply_cache_stats_enable, apply_cache_stats_reset};
+pub use manager::{Manager, ManagerConfig, MemStats, DEFAULT_ITE_CACHE_SLOTS, apply_cache_stats, apply_cache_stats_enable, apply_cache_stats_reset, apply_cache_patterns};
 pub use slab::{Diff, Slab};

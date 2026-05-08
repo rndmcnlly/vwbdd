@@ -24,6 +24,14 @@ static APPLY_HITS: AtomicU64 = AtomicU64::new(0);
 static APPLY_COLL: AtomicU64 = AtomicU64::new(0);
 static APPLY_EMPTY: AtomicU64 = AtomicU64::new(0);
 
+// Pattern-distribution counters: what shape are the (f,g,h) triples
+// hitting the cache? Each call is classified into exactly one bucket.
+// Used to design cache-key canonicalization (§4.21).
+static PAT_AND: AtomicU64 = AtomicU64::new(0); // h == F (so ite(f,g,F) = f ∧ g)
+static PAT_OR: AtomicU64 = AtomicU64::new(0); // g == T (so ite(f,T,h) = f ∨ h)
+static PAT_NOT: AtomicU64 = AtomicU64::new(0); // g == F, h == T (so ite(f,F,T) = ¬f)
+static PAT_OTHER: AtomicU64 = AtomicU64::new(0); // three-way ite with no shortcut pattern
+
 enum ApplyEvent { Hit, Coll, Empty }
 
 #[inline]
@@ -36,6 +44,26 @@ fn apply_stats_bump(ev: ApplyEvent) {
         ApplyEvent::Coll => APPLY_COLL.fetch_add(1, Ordering::Relaxed),
         ApplyEvent::Empty => APPLY_EMPTY.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+#[inline]
+fn apply_stats_bump_pattern(f: Ref, g: Ref, h: Ref) {
+    if !APPLY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = f;
+    let t = Ref::Terminal(true);
+    let ff = Ref::Terminal(false);
+    let counter: &AtomicU64 = if g == ff && h == t {
+        &PAT_NOT
+    } else if g == t {
+        &PAT_OR
+    } else if h == ff {
+        &PAT_AND
+    } else {
+        &PAT_OTHER
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Enable or disable the apply-cache counters. Default off. Turn on
@@ -54,12 +82,28 @@ pub fn apply_cache_stats() -> (u64, u64, u64) {
     )
 }
 
+/// Read-only snapshot of the ite-pattern-distribution counters.
+/// `(and, or, not, other)` — how many calls matched each shape?
+/// Useful for designing cache-key canonicalization.
+pub fn apply_cache_patterns() -> (u64, u64, u64, u64) {
+    (
+        PAT_AND.load(Ordering::Relaxed),
+        PAT_OR.load(Ordering::Relaxed),
+        PAT_NOT.load(Ordering::Relaxed),
+        PAT_OTHER.load(Ordering::Relaxed),
+    )
+}
+
 /// Reset the apply-cache counters to zero. Used by the sweep harness
 /// between runs so each cache-size sample is clean.
 pub fn apply_cache_stats_reset() {
     APPLY_HITS.store(0, Ordering::Relaxed);
     APPLY_COLL.store(0, Ordering::Relaxed);
     APPLY_EMPTY.store(0, Ordering::Relaxed);
+    PAT_AND.store(0, Ordering::Relaxed);
+    PAT_OR.store(0, Ordering::Relaxed);
+    PAT_NOT.store(0, Ordering::Relaxed);
+    PAT_OTHER.store(0, Ordering::Relaxed);
 }
 
 /// Fast mixing hash for an (f, g, h) ite-cache triple. Splitmix-style chain.
@@ -400,6 +444,7 @@ impl Manager {
     /// None on empty slot or collision miss.
     #[inline]
     fn ite_cache_get(&self, f: Ref, g: Ref, h: Ref) -> Option<Ref> {
+        apply_stats_bump_pattern(f, g, h);
         let slot = (ite_key_hash(f, g, h) & self.ite_cache_mask) as usize;
         let e = &self.ite_cache[slot];
         let pf = PackedRef::pack(f);

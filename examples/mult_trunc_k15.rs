@@ -12,7 +12,10 @@
 //! recorded in VWBDD.md §3.4. No OxiDD here: we want a clean single-
 //! engine profile, not a head-to-head.
 
-use vwbdd::{Manager, Ref};
+use vwbdd::{
+    apply_cache_patterns, apply_cache_stats, apply_cache_stats_enable, apply_cache_stats_reset,
+    Manager, Ref,
+};
 
 fn vw_vars_trunc(m: &mut Manager, k: u32) -> (Vec<Ref>, Vec<Ref>, Vec<Ref>) {
     let f = m.r#false();
@@ -75,6 +78,13 @@ fn vw_eq(m: &mut Manager, p: &[Ref], z: &[Ref]) -> Ref {
 
 fn main() {
     let k: u32 = 15;
+    // Enable stats only if env var is set so regular profiling runs
+    // aren't slowed by the atomic increments.
+    let stats = std::env::var_os("VWBDD_APPLY_STATS").is_some();
+    if stats {
+        apply_cache_stats_reset();
+        apply_cache_stats_enable(true);
+    }
     let start = std::time::Instant::now();
 
     let mut m = Manager::new();
@@ -116,6 +126,26 @@ fn main() {
         mem.arena_bytes_per_node(),
         mem.total_bytes_per_node()
     );
+
+    if stats {
+        apply_cache_stats_enable(false);
+        let (h, c, e) = apply_cache_stats();
+        let total = h + c + e;
+        let (a, o, n, t) = apply_cache_patterns();
+        let pat_total = a + o + n + t;
+        eprintln!();
+        eprintln!("apply-cache @ {} calls: hit {:.1}% coll-miss {:.1}% empty-miss {:.1}%",
+            total,
+            100.0 * h as f64 / total as f64,
+            100.0 * c as f64 / total as f64,
+            100.0 * e as f64 / total as f64);
+        eprintln!("ite-pattern @ {} calls: AND {:.1}% OR {:.1}% NOT {:.1}% OTHER {:.1}%",
+            pat_total,
+            100.0 * a as f64 / pat_total as f64,
+            100.0 * o as f64 / pat_total as f64,
+            100.0 * n as f64 / pat_total as f64,
+            100.0 * t as f64 / pat_total as f64);
+    }
 
     // Use `r` so the optimizer can't eliminate the build.
     std::hint::black_box(r);
