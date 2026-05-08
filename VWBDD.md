@@ -971,6 +971,35 @@ Packing the tag into the slot u64 (one array instead of two) *sounds* better on 
 **General lesson.** When a profile fingers a function as a hotspot, the next move isn't "optimize that function" but "figure out why it's hot." The 24% on `lookup` decomposes into several distinct costs with distinct caches; optimizing the wrong one makes things worse. Further wins here would probably come from a structurally different approach (multi-slot bucketed tables, linked-list-per-bucket, etc.) rather than slot-layout microtuning.
 
 
+### 4.19 Hotlist: no temporal locality to exploit
+
+Separate idea, pursued with instrumentation rather than implementation: **a tiny recency hotlist in front of the unique table.** The intuition: if recently-created nodes get looked up again soon (temporal locality on `(var, lo, hi)` triples), a small SIMD-checkable hotlist could answer in ~1 ns and skip the full unique-table lookup.
+
+To measure, we ran a thread-local FIFO-window simulator alongside the real `make_node`: record the hash of every triple, and for each lookup count whether any of the last N entries would have answered. Sizes N = 4, 8, 16, 32, 64, 128, 256.
+
+Results at mult-trunc k=15 steady state (~36M `make_node` calls, 17% of which found an existing node — see §4.17):
+
+| window size N | hits on real-present lookups | hits on all `make_node` calls |
+|---:|---:|---:|
+|   4 | 0.3% | 0.05% |
+|   8 | 0.7% | 0.12% |
+|  16 | 1.5% | 0.26% |
+|  32 | 2.9% | 0.50% |
+|  64 | 5.1% | 0.89% |
+| 128 | 8.2% | 1.4% |
+| 256 | 11.7% | 2.0% |
+
+Trajectory: hit rates *decrease* with scale (a 256-window catches ~17% of real-presents at 1M calls, ~12% at 36M calls). The access pattern is dominated by structural symmetry across distant parts of the DAG, not by temporal locality within the recent construction window.
+
+**Cost model rules out every size.** A 4-slot SIMD hotlist check is 1-2 ns per call. At a 0.05% hit rate on the full 36M calls, it would save at most a few microseconds of work across the whole run while adding 1-2 ns × 36M = 50-70 ms of overhead. Net regression ~1000×. A 256-slot hotlist with an associative probe is 3-5 ns per check, catches 2% of calls, saves ~5 ns per hit: 7-14 ms saved, 110-180 ms added. Still a regression.
+
+**Verdict: rejected without implementation.** Unlike §4.18 (implemented and measured two rejections), this one was answered by instrumentation alone because the hit-rate numbers are too low for any reasonable hotlist cost to balance.
+
+**Where this pushes our thinking.** The temporal-locality lever we thought we saw doesn't exist on `make_node`. If we want fewer `make_node` calls, the lever has to be higher: **fewer `ite` calls that reach `make_node`** (e.g., better apply-cache hit rates, or fused boolean operators that don't build intermediate BDDs that get discarded). The apply cache at `(f, g, h)` level already captures the locality that `make_node` can't. Measuring apply-cache hit rates is the next feasibility probe, not more work at the unique-table layer.
+
+The sim harness isn't checked in (same reason as the §4.16 codec shootout: keeping a one-shot measurement's code around is maintenance debt). To reproduce: wrap the `make_node` hash computation with a FIFO ring buffer and track hits per window size, or instrument `make_node` to emit `(hash, was_present)` pairs to a trace and post-process.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
