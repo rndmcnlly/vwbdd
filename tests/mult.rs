@@ -46,7 +46,7 @@ fn run_mult(k: u32) -> (usize, usize, vwbdd::MemStats) {
     );
 
     // GC to reachable set, report post-GC mem.
-    let remapped = vw.gc(&[vrel]);
+    let remapped = vw.drop_roots(&[vrel]);
     let reachable_post = vw_reachable(&vw, remapped[0]);
     assert_eq!(reachable_post, reachable, "GC should preserve reachable count");
     assert_eq!(

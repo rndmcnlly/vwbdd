@@ -467,97 +467,23 @@ impl Manager {
 
     /// **Drop everything except these roots.** Replaces the arena with
     /// a fresh one containing only the closure of `keep`, returning the
-    /// translated roots.
+    /// translated roots. Equivalent to `self.gc(0, keep)`; this is the
+    /// intent-level name recommended for full collections.
     ///
-    /// Intent-level alias for [`Self::gc`]. After this call the arena is
-    /// function-canonical for the given roots (running GC again would find
-    /// nothing to remove). Not *layout-canonical*: two managers that built
-    /// the same BDD via different op sequences can produce different byte
-    /// encodings of the same reduced DAG. The apply cache is flushed.
+    /// After this call the arena is function-canonical for `keep`
+    /// (running GC again would find nothing to remove). Not
+    /// *layout-canonical*: two managers that built the same BDD via
+    /// different op sequences can produce different byte encodings of
+    /// the same reduced DAG. The apply cache is flushed.
     pub fn drop_roots(&mut self, keep: &[Ref]) -> Vec<Ref> {
-        self.gc(keep)
+        self.gc(0, keep)
     }
 
-    /// Copying garbage collector. Takes a slice of roots, builds a fresh
-    /// arena containing only the nodes reachable from those roots, and
-    /// returns the remapped roots. The apply cache is flushed; callers
-    /// must replace their own held refs with the returned ones.
-    pub fn gc(&mut self, roots: &[Ref]) -> Vec<Ref> {
-        let mut remap: HashMap<u64, Ref> = HashMap::new();
-        let mut new_buf: Vec<u8> = Vec::new();
-
-        enum Frame {
-            Enter(u64),
-            Exit(u64),
-        }
-        let old_buf = &self.buf;
-
-        for &root in roots {
-            if let Ref::Node(off) = root {
-                if remap.contains_key(&off) {
-                    continue;
-                }
-                let mut stack: Vec<Frame> = vec![Frame::Enter(off)];
-                while let Some(frame) = stack.pop() {
-                    match frame {
-                        Frame::Enter(o) => {
-                            if remap.contains_key(&o) {
-                                continue;
-                            }
-                            let (node, _) = decode_node(&old_buf[o as usize..], o);
-                            stack.push(Frame::Exit(o));
-                            if let Ref::Node(lo_off) = node.lo {
-                                if !remap.contains_key(&lo_off) {
-                                    stack.push(Frame::Enter(lo_off));
-                                }
-                            }
-                            if let Ref::Node(hi_off) = node.hi {
-                                if !remap.contains_key(&hi_off) {
-                                    stack.push(Frame::Enter(hi_off));
-                                }
-                            }
-                        }
-                        Frame::Exit(o) => {
-                            if remap.contains_key(&o) {
-                                continue;
-                            }
-                            let (node, _) = decode_node(&old_buf[o as usize..], o);
-                            let new_lo = translate(&remap, node.lo);
-                            let new_hi = translate(&remap, node.hi);
-                            // Reduction (shouldn't fire on canonical input).
-                            let new_ref = if new_lo == new_hi {
-                                new_lo
-                            } else {
-                                let new_off = new_buf.len() as u64;
-                                encode_node(node.var, new_lo, new_hi, new_off, &mut new_buf);
-                                Ref::Node(new_off)
-                            };
-                            remap.insert(o, new_ref);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Swap in the new arena.
-        self.buf = new_buf;
-
-        // Rebuild unique table from the new arena.
-        self.unique_rebuild_from_arena();
-
-        // Flush apply cache: old offsets are dead.
-        for e in self.ite_cache.iter_mut() {
-            *e = IteCacheEntry::EMPTY;
-        }
-        self.ite_cache_len = 0;
-
-        // Translate roots.
-        roots.iter().map(|&r| translate(&remap, r)).collect()
-    }
-
-    /// **Minor (tail-only) garbage collection.** Frees unreachable bytes
-    /// in the *tail* of the arena (the region past `base_len`), leaving
-    /// the base bytes `[0..base_len)` untouched byte-for-byte.
+    /// **Generational garbage collector.** Frees unreachable bytes in
+    /// the *tail* of the arena (the region past `base_len`), leaving
+    /// the base bytes `[0..base_len)` untouched byte-for-byte. Call
+    /// with `base_len = 0` for a full collection (equivalent to
+    /// [`Self::drop_roots`]).
     ///
     /// Used internally by [`Self::diff_since`](crate::slab) to enforce
     /// the clean-bytes invariant on diffs it produces. Exposed publicly
@@ -571,8 +497,15 @@ impl Manager {
     /// `>= base_len`). Tail→base references are fine and preserve their
     /// absolute offsets (though delta encodings may shift).
     ///
-    /// **Cost/benefit** (measured in `tests/minor_gc_savings.rs` on
-    /// `trunc-mult` at k=5..11):
+    /// **Full-collection cost.** At `base_len = 0` this clones the
+    /// entire arena once (into `old_tail`) before re-encoding. A
+    /// dedicated full-gc path could save that clone by building a
+    /// fresh `Vec<u8>` and swapping; we chose not to in favor of one
+    /// unified code path. For very large arenas with mostly-scratch
+    /// contents, that's a 2× memory blip during the call.
+    ///
+    /// **Cost/benefit of tail-only collection** (measured in
+    /// `tests/minor_gc_savings.rs` on `trunc-mult` at k=5..11):
     ///
     /// | tail shape                    | byte shrink         |
     /// |-------------------------------|---------------------|
@@ -584,13 +517,14 @@ impl Manager {
     /// new (compacted) parent offsets can push LEB128 child-delta codes
     /// across a 7-bit boundary, costing more bytes than the dead nodes
     /// would have saved. Net negative by ~1% at k=11 when only 4 of
-    /// 3075 tail nodes were dead. Reach for this when the query is
-    /// scratch-dominated; skip it when accumulating live structure.
-    pub fn gc_tail(&mut self, base_len: u64, roots: &[Ref]) -> Vec<Ref> {
+    /// 3075 tail nodes were dead. Reach for tail-only GC when the
+    /// query is scratch-dominated; skip it when accumulating live
+    /// structure.
+    pub fn gc(&mut self, base_len: u64, roots: &[Ref]) -> Vec<Ref> {
         let buf_len = self.buf.len() as u64;
         assert!(
             base_len <= buf_len,
-            "gc_tail: base_len {} > arena len {}",
+            "gc: base_len {} > arena len {}",
             base_len, buf_len
         );
         if base_len == buf_len {
@@ -599,7 +533,7 @@ impl Manager {
         }
 
         // remap: tail-offset → new Ref. Terminals and base nodes are
-        // NOT stored here; they pass through translate_young.
+        // NOT stored here; they pass through `translate`.
         let mut remap: HashMap<u64, Ref> = HashMap::new();
 
         // Snapshot the old tail bytes so we can read children from it
@@ -671,8 +605,8 @@ impl Manager {
         for old_off in post_order {
             let tail_rel = (old_off - base_len) as usize;
             let (node, _) = decode_node(&old_tail[tail_rel..], old_off);
-            let new_lo = translate_young(&remap, node.lo, base_len);
-            let new_hi = translate_young(&remap, node.hi, base_len);
+            let new_lo = translate(&remap, node.lo, base_len);
+            let new_hi = translate(&remap, node.hi, base_len);
             let new_ref = if new_lo == new_hi {
                 new_lo
             } else {
@@ -696,7 +630,7 @@ impl Manager {
         // Translate roots for the caller.
         roots
             .iter()
-            .map(|&r| translate_young(&remap, r, base_len))
+            .map(|&r| translate(&remap, r, base_len))
             .collect()
     }
 
@@ -725,17 +659,15 @@ impl Manager {
     }
 }
 
-fn translate(remap: &HashMap<u64, Ref>, r: Ref) -> Ref {
-    match r {
-        Ref::Terminal(_) => r,
-        Ref::Node(off) => *remap.get(&off).expect("root unreachable in remap"),
-    }
-}
-
-/// Minor-GC variant of [`translate`]: base-generation refs pass through
-/// unchanged (they weren't walked), young-generation refs go through the
-/// remap.
-fn translate_young(remap: &HashMap<u64, Ref>, r: Ref, base_len: u64) -> Ref {
+/// Translate a ref through a GC remap. Base-generation refs (offset
+/// `< base_len`) pass through unchanged — they weren't walked, so they
+/// aren't in the remap. Young-generation refs are looked up; their
+/// absence is a bug (every reachable tail node should have been
+/// visited). Terminals pass through.
+///
+/// At `base_len = 0` this is the full-gc translator: every Node ref
+/// goes through the remap.
+fn translate(remap: &HashMap<u64, Ref>, r: Ref, base_len: u64) -> Ref {
     match r {
         Ref::Terminal(_) => r,
         Ref::Node(off) => {
@@ -744,7 +676,7 @@ fn translate_young(remap: &HashMap<u64, Ref>, r: Ref, base_len: u64) -> Ref {
             } else {
                 *remap
                     .get(&off)
-                    .expect("young root unreachable in minor-GC remap")
+                    .expect("young root unreachable in GC remap")
             }
         }
     }

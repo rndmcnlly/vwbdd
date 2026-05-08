@@ -2,7 +2,8 @@
 //!
 //! Under the invariant (see `src/slab.rs` module docs), every [`Diff`]
 //! crossing a public boundary is function-canonical: `diff_since`
-//! runs [`Manager::gc_tail`] internally before extracting bytes.
+//! runs [`Manager::gc`] (tail-only variant) internally before
+//! extracting bytes.
 //!
 //! This benchmark reports, across a sweep of trunc-mult base sizes
 //! and a few extend shapes, the ratio of:
@@ -83,7 +84,7 @@ fn measure_k(k: u32, ops_name: &str, ops: fn(&mut Manager, &[Ref]) -> Vec<Ref>) 
         let dirty_tail_bytes = m.buf_len() - base_len as usize;
         let dirty_tail_nodes = m.num_nodes() - base_node_count;
         // Now clean it.
-        let cleaned = m.gc_tail(base_len, &_new_roots);
+        let cleaned = m.gc(base_len, &_new_roots);
         let _ = cleaned;
         let clean_tail_nodes = m.num_nodes() - base_node_count;
         (dirty_tail_bytes, dirty_tail_nodes, clean_tail_nodes)
@@ -115,7 +116,7 @@ fn measure_k(k: u32, ops_name: &str, ops: fn(&mut Manager, &[Ref]) -> Vec<Ref>) 
 fn minor_gc_savings_sweep() {
     println!("\n=== what the clean-bytes invariant saves at the wire ===");
     println!("base = (x * y) mod 2^k == z\n");
-    println!("shows: tail_bytes BEFORE gc_tail vs AFTER gc_tail (what extend_slab ships)");
+    println!("shows: tail_bytes BEFORE vs AFTER tail-GC (what extend_slab ships)");
     println!("  simple: and(base, x[0])                    — 1 live node, ~no scratch");
     println!("  mixed:  and(base, xor(x[0], y[0]))         — small live result + ite scratch");
     println!("  fat:    or/and/xor(base, not(base))        — all scratch, results fold to terminals\n");

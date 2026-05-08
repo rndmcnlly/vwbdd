@@ -995,15 +995,29 @@ focused on restoring curiosity-per-keystroke:
   need it should rebuild it on top of `ingest_slab` + a caller-chosen
   serializer.
 
+- **Unified the two GCs.** The follow-up session proved that
+  `gc(roots)` (major) was exactly `gc_tail(0, roots)` (minor with an
+  empty base): same arena bytes, same roots, byte-identical output.
+  The two implementations had diverged only in which buffer they
+  wrote to (`new_buf` then swap, vs snapshot-clone then in-place
+  rewrite). Deleted the standalone major-GC and the `translate`
+  helper; renamed `gc_tail` → `gc(base_len, roots)` as the single
+  generational primitive; `drop_roots(keep)` stays as the ergonomic
+  full-collection entry point and calls `gc(0, keep)` internally.
+  Cost: one `buf.clone()` during a full collection. Gained: ~70 LOC
+  in `manager.rs`, and the generational story is now the *only*
+  story rather than a special case bolted on.
+
 ### What it bought us
 
 | metric                       | before | after | change |
 |------------------------------|-------:|------:|-------:|
-| `src/` LOC                   |  2,711 | 1,440 |   −47% |
-| `tests/` LOC                 |  2,319 | 1,753 |   −24% |
-| total LOC                    |  5,030 | 3,193 |   −37% |
-| `src/manager.rs` LOC         |    941 |   588 |   −38% |
+| `src/` LOC                   |  2,711 | 1,362 |   −50% |
+| `tests/` LOC                 |  2,319 | 2,226 |    −4% |
+| total LOC                    |  5,030 | 3,588 |   −29% |
+| `src/manager.rs` LOC         |    941 |   713 |   −24% |
 | generic parameters on `Manager` |    2 |     0 |       |
+| public GC methods            |      3 |     2 |       |
 | passing tests (correctness)  |     78 |    65 |  −13*  |
 | wall-clock perf vs OxiDD     |  ~1.75× slower |  same order |    —  |
 

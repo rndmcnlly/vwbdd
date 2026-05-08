@@ -35,7 +35,7 @@ fn run_vw(k: u32) -> VwResult {
     let mut vw = Manager::new();
     let r = build_mult_trunc(&mut vw, k);
     let nodes = vw_reachable(&vw, r);
-    let _ = vw.gc(&[r]);
+    let _ = vw.drop_roots(&[r]);
     let mem = vw.mem_stats();
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     VwResult {

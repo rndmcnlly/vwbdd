@@ -38,7 +38,7 @@
 //!    LEB128. Minimizing total `leb128_len(parent_offset − child_offset)`
 //!    is a bandwidth-minimization problem (NP-hard in general).
 //!
-//! The `gc_tail` benchmark in `tests/minor_gc_savings.rs` measured the
+//! The tail-GC benchmark in `tests/minor_gc_savings.rs` measured the
 //! gap between (2) and (3): compacting a tail by GC changed byte counts
 //! by ±1% on near-dense tails because the new layout's delta
 //! distribution crossed LEB128 boundaries differently.
@@ -182,7 +182,7 @@ impl Manager {
     /// itself is mutated (its arena is replaced, its unique table
     /// rebuilt, its apply cache flushed).
     pub fn slab_for(&mut self, roots: &[Ref]) -> Slab {
-        let new_roots = self.gc(roots);
+        let new_roots = self.drop_roots(roots);
         Slab {
             bytes: self.arena_slice(0).to_vec(),
             roots: new_roots,
@@ -194,7 +194,8 @@ impl Manager {
     ///
     /// **Clean-bytes invariant**: the returned diff's `tail` is
     /// function-canonical for `new_roots`. Internally runs a tail-only
-    /// GC ([`Manager::gc_tail`]) before extracting the tail bytes.
+    /// GC ([`Manager::gc`] with nonzero `base_len`) before extracting
+    /// the tail bytes.
     ///
     /// Typical use: right after [`Self::ingest_slab`], record
     /// `base_len = m.buf_len()`. Run ops. Call `diff_since` with that
@@ -210,7 +211,7 @@ impl Manager {
             base_len, cur_len
         );
         // Enforce the clean-bytes invariant.
-        let cleaned_roots = self.gc_tail(base_len, new_roots);
+        let cleaned_roots = self.gc(base_len, new_roots);
         let tail = self.arena_slice(base_len as usize).to_vec();
         Diff {
             base_len,

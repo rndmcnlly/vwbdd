@@ -122,11 +122,11 @@ fn client_applies_diff_and_gets_matching_nodes() {
     // Reference may carry dead nodes from the `not` call's intermediates;
     // GC to match what slab_for does on the base + what apply_diff
     // leaves in place.
-    let _ = reference.gc(&[and, _nand]);
+    let _ = reference.drop_roots(&[and, _nand]);
 
     // The client's live node set (reachable from base_roots + new_roots)
     // must match the reference's post-gc node set.
-    let _ = client.gc(&[base_roots[0], new_roots[0]]);
+    let _ = client.drop_roots(&[base_roots[0], new_roots[0]]);
     assert_eq!(
         client.num_nodes(),
         reference.num_nodes(),
@@ -197,7 +197,7 @@ fn gc_via_slab_matches_direct_gc() {
     let slab = m2.slab_for(&[a2]);
 
     // m1: direct gc on m1's own `a`.
-    let _ = m1.gc(&[a]);
+    let _ = m1.drop_roots(&[a]);
     let len_after_gc = m1.buf_len();
 
     assert!(
@@ -267,9 +267,10 @@ fn apply_empty_diff_is_noop() {
 // ---------------------------------------------------------------------------
 // Minor (tail-only) GC: the generational story.
 //
-// The claim: `gc_tail(base_len, roots)` collects only the tail, leaving
-// the base bytes byte-identical. It's the natural pre-ship pass — after
-// running ops that create dead intermediates, minor-GC'ing before
+// The claim: `gc(base_len, roots)` with nonzero `base_len` collects
+// only the tail, leaving the base bytes byte-identical. It's the
+// natural pre-ship pass: after running ops that create dead
+// intermediates, minor-GC'ing before
 // `diff_since` produces a smaller shippable diff than dumping the raw
 // tail would.
 // ---------------------------------------------------------------------------
@@ -297,7 +298,7 @@ fn minor_gc_preserves_base_bytes_exactly() {
     // Minor GC, keeping only the base root (tail-orphaned: nothing in
     // the tail is actually reachable from this root, since the root is
     // a base node).
-    let kept = m.gc_tail(base_len, &[and_root]);
+    let kept = m.gc(base_len, &[and_root]);
     assert_eq!(kept[0], and_root, "base root passes through unchanged");
 
     // Base bytes untouched.
@@ -371,7 +372,7 @@ fn minor_gc_keeps_live_tail_nodes() {
     let _dead = m.xor(and, and);
 
     let live_before = m.num_nodes();
-    let kept = m.gc_tail(base_len, &[and, nand]);
+    let kept = m.gc(base_len, &[and, nand]);
     let live_after = m.num_nodes();
 
     assert_eq!(kept.len(), 2);
@@ -415,7 +416,7 @@ fn minor_gc_empty_tail_is_noop() {
     let base_len = m.buf_len() as u64;
     assert_eq!(base_len, m.buf_len() as u64);
 
-    let kept = m.gc_tail(base_len, &base_roots);
+    let kept = m.gc(base_len, &base_roots);
     assert_eq!(kept, base_roots);
     assert_eq!(m.buf_len() as u64, base_len);
 }
@@ -442,7 +443,7 @@ fn minor_gc_enables_tighter_extend_roundtrip() {
         let _throwaway = m.and(and, nand); // contradiction, folds
         let _more_throwaway = m.or(and, nand); // tautology, folds
         // Minor GC before shipping.
-        let keep = m.gc_tail(base_len, &[nand]);
+        let keep = m.gc(base_len, &[nand]);
         m.diff_since(base_len, &keep)
     };
 
@@ -464,8 +465,8 @@ fn minor_gc_enables_tighter_extend_roundtrip() {
     let ref_nand = reference.not(ref_base_roots[0]);
 
     // GC both to the same root set to compare canonical sizes.
-    let _ = client.gc(&[shipped_roots[0]]);
-    let _ = reference.gc(&[ref_nand]);
+    let _ = client.drop_roots(&[shipped_roots[0]]);
+    let _ = reference.drop_roots(&[ref_nand]);
     assert_eq!(
         client.num_nodes(), reference.num_nodes(),
         "shipped-via-minor-GC'd-diff produces the same BDD as the reference build"

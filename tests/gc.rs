@@ -36,7 +36,7 @@ fn gc_with_no_roots_empties_manager() {
     let y = var(&mut m, 1);
     let _ = m.and(x, y);
     assert!(m.num_nodes() > 0);
-    let _ = m.gc(&[]);
+    let _ = m.drop_roots(&[]);
     assert_eq!(m.num_nodes(), 0);
     assert_eq!(m.buf_len(), 0);
 }
@@ -50,7 +50,7 @@ fn gc_preserves_single_root_count() {
     let y = var(&mut m, 1);
     let and = m.and(x, y);
     let before = reachable(&m, and);
-    let remapped = m.gc(&[and]);
+    let remapped = m.drop_roots(&[and]);
     assert_eq!(remapped.len(), 1);
     let after = reachable(&m, remapped[0]);
     assert_eq!(before, after);
@@ -63,7 +63,7 @@ fn gc_terminal_roots_yield_terminal_remap() {
     let mut m = Manager::new();
     let t = m.r#true();
     let f = m.r#false();
-    let remapped = m.gc(&[t, f]);
+    let remapped = m.drop_roots(&[t, f]);
     assert_eq!(remapped[0], t);
     assert_eq!(remapped[1], f);
     assert_eq!(m.num_nodes(), 0);
@@ -85,7 +85,7 @@ fn gc_post_ops_still_work() {
     let reachable_xyz_before = reachable(&m, xyz_before);
 
     // GC keeping only xy; drop xyz.
-    let remapped = m.gc(&[xy]);
+    let remapped = m.drop_roots(&[xy]);
     let xy_new = remapped[0];
 
     // Re-declare variables and rebuild (vars are still registered!).
@@ -146,7 +146,7 @@ fn gc_massively_shrinks_after_threshold_workload() {
 
     let before_total = m.num_nodes();
     let reach = reachable(&m, acc);
-    let remapped = m.gc(&[acc]);
+    let remapped = m.drop_roots(&[acc]);
     let after_total = m.num_nodes();
 
     assert_eq!(after_total, reach, "GC should leave exactly reachable nodes");
