@@ -1000,6 +1000,45 @@ Trajectory: hit rates *decrease* with scale (a 256-window catches ~17% of real-p
 The sim harness isn't checked in (same reason as the §4.16 codec shootout: keeping a one-shot measurement's code around is maintenance debt). To reproduce: wrap the `make_node` hash computation with a FIFO ring buffer and track hits per window size, or instrument `make_node` to emit `(hash, was_present)` pairs to a trace and post-process.
 
 
+### 4.20 Apply-cache sizing: 50% hit rate is a structural ceiling
+
+The hotlist rejection in §4.19 pointed us up the call chain: to reduce `make_node` volume, shrink the call volume by shrinking `ite` fanout — which means raising apply-cache hit rate. We instrumented `ite_cache_get` with counters for (hit, collision-miss, empty-miss), ran `examples/apply_cache_sweep` across cache sizes 2^18..2^24 and `k = 12..15`, and got this:
+
+| k | slots | wall (ms) | `ite_cache_get` calls | hit% | coll-miss% | empty-miss% |
+|--:|--:|--:|--:|--:|--:|--:|
+| 12 | 256K | 285 | 3.6M | **49.2** | 43.6 | 7.2 |
+| 12 | 2M (default) | 444 | 3.5M | **49.3** | 16.7 | 34.0 |
+| 12 | 16M | 441 | 3.5M | **49.3** | 2.6 | 48.1 |
+| 13 | 256K | 783 | 10.3M | **49.3** | 48.2 | 2.5 |
+| 13 | 2M | 1115 | 9.6M | **49.5** | 30.8 | 19.7 |
+| 13 | 16M | 1166 | 9.5M | **49.5** | 6.6 | 43.9 |
+| 14 | 256K | 2864 | 31.9M | **49.1** | 50.1 | 0.8 |
+| 14 | 2M | 3186 | 26.2M | **49.6** | 42.4 | 8.0 |
+| 14 | 16M | 3398 | 25.8M | **49.7** | 15.3 | 35.0 |
+| 15 | 256K | 11837 | 116.7M | **47.9** | 51.8 | 0.2 |
+| 15 | 2M | 10076 | 72.4M | **49.6** | 47.5 | 2.9 |
+| 15 | 16M | 10648 | 69.5M | **49.8** | 29.1 | 21.1 |
+
+Three things jump out.
+
+**Hit rate is flat.** Ignoring the k=15 at 256K regime (where the cache is so undersized that even same-call recency fails), the apply cache finds the previous answer for the same `(f, g, h)` triple on ~49.5% of calls, at every size tested. 256K slots or 16M slots, k=12 or k=15: always 49-50%. This is not a working-set-size ceiling; it's a **structural property of the workload**. About half of `ite_cache_get` queries are fundamentally first-time queries on novel triples, which no cache can rescue.
+
+**Bigger cache does not help wall time.** k=12 gets *worse* with size (285 ms → 441 ms). At k=15 the best size is 2M (the current default); 16M adds 6% wall with no hit-rate benefit. The crossover is exactly what cache-hierarchy theory predicts: a 2M-slot cache is 64 MiB, borderline DRAM-resident but often in L3; a 16M-slot cache is 512 MiB, a guaranteed DRAM miss per probe. The work saved from ~20% fewer collision-misses is exactly offset by the slower probes.
+
+**Call volume drops with cache size, *but* the ratio doesn't.** At k=15, 256K slots → 116.7M `ite_cache_get` calls; 2M slots → 72.4M calls; 16M slots → 69.5M calls. The cache does save recursive fanout — each hit prevents the recursive ite subtree from running — but the savings compound logarithmically, not linearly. Beyond 2M slots the call-volume savings are small and the per-call cost is larger.
+
+**What this means.**
+
+1. The **current `DEFAULT_ITE_CACHE_SLOTS = 1 << 21` (2M slots, 64 MiB) is well-tuned** for k~15 mult workloads. It sits at the knee.
+2. The **apply cache has hit its ceiling.** Half of `ite_cache_get` calls are novel triples; no amount of cache memory will help. If we want fewer `make_node` calls we need a structurally different apply algorithm, not a bigger cache.
+3. The **obvious structural lever** is to canonicalize `(f, g, h)` *before* cache lookup so more triples alias to the same cache key. For example, `ite(f, g, g)` = `g` trivially, but also `ite(f, g, h) = ite(¬f, h, g)` (normal-form choice on `f` polarity), which would fold two keys into one. A shared ~10% hit-rate bump here plausibly saves 5–10% wall. Requires care to preserve correctness.
+4. Other structural levers: fused `and_many`/`or_many` that amortize the cofactor walk across N operands (wins when that pattern is common, not proven on mult); relational product / `and_exists` for the ∃x.f∧g pattern (wins when present, again not our workload).
+
+**What this rules out.** Anyone (including future-us) who proposes "the apply cache is slow; make it bigger" can look at this table and see that the argument stops at 2M slots for mult-trunc. The 24-26 B/node total-memory figure from §3.4 already includes the 64 MiB cache as ~6 B/node amortized; pushing to 256 MiB would lose wall time and balloon the memory claim.
+
+**Kept in the tree.** `examples/apply_cache_sweep.rs` produces this table in ~2 minutes on an M3 Max. Unlike the §4.18 and §4.19 throwaway harnesses, this one has ongoing diagnostic value: any future change to hash, cache policy, or apply algorithm should re-run the sweep to check the 49.5% ceiling moves. The counters themselves are exposed via `apply_cache_stats_{enable,reset,stats}` in the public API; enable-gate is a single branch predictor-friendly atomic bool, off by default, zero effect on non-instrumented workloads.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -1065,9 +1104,10 @@ vwbdd/
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
 │   ├── unique.rs                — CompactUnique (linear-probe unique table, u64 slots) + UniqueTables (per-var family, §4.7, §4.17)
 │   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15). Also Slab::support, Slab::sat_count.
-│   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots, gc (generational, §4.15), apply cache (§4.13)
+│   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots, gc (generational, §4.15), apply cache (§4.13), apply-cache stat counters (§4.20)
 ├── examples/
-│   └── mult_trunc_k15.rs        — profiling target for `cargo instruments`, inlines its own mult-trunc builders (§4.17)
+│   ├── mult_trunc_k15.rs        — profiling target for `cargo instruments`, inlines its own mult-trunc builders (§4.17)
+│   └── apply_cache_sweep.rs     — apply-cache hit/miss rates vs size, mult-trunc k=12..15 (§4.20)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
     ├── node.rs                  — per-node encode/decode

@@ -6,9 +6,61 @@
 //! unique table and apply cache both store u64 offsets.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::codec::{decode_node, decode_var, encode_node, Node, Ref, ref_to_u64};
 use crate::unique::{unique_key_hash, UniqueTables};
+
+// --- Apply-cache instrumentation (see §4.20) ---
+//
+// Counters for `ite_cache_get` outcomes. Gated on a single Relaxed
+// bool load (branch-predictor friendly; disabled by default) so the
+// baseline hot path stays unchanged. The sweep harness
+// (`examples/apply_cache_sweep.rs`) flips the gate on, runs, reads,
+// resets.
+
+static APPLY_ENABLED: AtomicBool = AtomicBool::new(false);
+static APPLY_HITS: AtomicU64 = AtomicU64::new(0);
+static APPLY_COLL: AtomicU64 = AtomicU64::new(0);
+static APPLY_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+enum ApplyEvent { Hit, Coll, Empty }
+
+#[inline]
+fn apply_stats_bump(ev: ApplyEvent) {
+    if !APPLY_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    match ev {
+        ApplyEvent::Hit => APPLY_HITS.fetch_add(1, Ordering::Relaxed),
+        ApplyEvent::Coll => APPLY_COLL.fetch_add(1, Ordering::Relaxed),
+        ApplyEvent::Empty => APPLY_EMPTY.fetch_add(1, Ordering::Relaxed),
+    };
+}
+
+/// Enable or disable the apply-cache counters. Default off. Turn on
+/// around the region of interest; read via `apply_cache_stats`.
+pub fn apply_cache_stats_enable(on: bool) {
+    APPLY_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Read-only snapshot of the apply-cache counters since the last
+/// reset. `(hits, collision-misses, empty-misses)`.
+pub fn apply_cache_stats() -> (u64, u64, u64) {
+    (
+        APPLY_HITS.load(Ordering::Relaxed),
+        APPLY_COLL.load(Ordering::Relaxed),
+        APPLY_EMPTY.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the apply-cache counters to zero. Used by the sweep harness
+/// between runs so each cache-size sample is clean.
+pub fn apply_cache_stats_reset() {
+    APPLY_HITS.store(0, Ordering::Relaxed);
+    APPLY_COLL.store(0, Ordering::Relaxed);
+    APPLY_EMPTY.store(0, Ordering::Relaxed);
+}
 
 /// Fast mixing hash for an (f, g, h) ite-cache triple. Splitmix-style chain.
 #[inline]
@@ -352,8 +404,13 @@ impl Manager {
         let e = &self.ite_cache[slot];
         let pf = PackedRef::pack(f);
         if e.f == pf && e.g == PackedRef::pack(g) && e.h == PackedRef::pack(h) {
+            apply_stats_bump(ApplyEvent::Hit);
             Some(e.r.unpack())
+        } else if e.f == PackedRef::EMPTY {
+            apply_stats_bump(ApplyEvent::Empty);
+            None
         } else {
+            apply_stats_bump(ApplyEvent::Coll);
             None
         }
     }
