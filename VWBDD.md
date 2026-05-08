@@ -10,16 +10,16 @@ Audience: the author, future collaborators, and anyone curious whether variable-
 
 We built a single-file Rust BDD engine where each node is encoded as a raw u8 `var` byte followed by two LEB128-encoded back-reference child codes, stored in an append-only byte buffer. Canonicity is enforced by a unique table keyed on a cheap hash of `(var, lo, hi)`; on probe, collisions are resolved by decoding the arena node and verifying.
 
-Across the mult-relation `x*y=z` from k=2 to k=11 (reachable nodes 29 to 7.6M):
+Across the mult-relation `x*y=z` from k=2 to k=11 and the truncated `(x*y) mod 2^k = z` workload from k=7 to k=17 (reachable nodes 29 to 82M):
 
 - **Correctness**: node counts match OxiDD exactly at every scale, verified differentially via a shared bitblaster running both engines in the same test.
-- **Arena compression**: post-GC, we store BDD nodes at **2.6 to 4.6 bytes each** (k=2 to k=11) vs OxiDD's fixed 16 B/node. Dominant factor is the byte-offset distance to child nodes, which LEB128 compresses well.
+- **Arena compression**: post-GC, we store BDD nodes at **3.9 to 5.4 bytes each** on the truncated workload across k=7..17, vs OxiDD's fixed 16 B/node. Dominant factor is the byte-offset distance to child nodes, which LEB128 compresses well.
 - **Single concrete engine**: one `Manager`, u64 arena offsets, one `Leb128Codec` — no trait parameterization. The §4.12 `Manager<C: NodeCodec, O: ArenaOffset>` experiment was retired in §8 on agility grounds; what remains is the working concrete configuration.
 - **Unique-table compression** (§4.7): `CompactUnique` — struct-of-arrays offset slots + parallel hash tags at **~12 B/node**, well below the 32 B/node a generic `HashMap<u64,u64>` would cost.
 - **Apply-cache compression** (§4.8, §4.11): a packed-ref encoding for the direct-mapped ite cache. 32 B/entry (half a cache line; two entries per line). Default cache total: **64 MiB**.
 - **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
-- **Total live memory**: **~20 B/node** (arena + unique table), plus the fixed apply cache. Roughly two-thirds of OxiDD's ~30-32 B/live-node.
-- **Wall-clock time**: order of ~1.5–2× slower than OxiDD at k=11.
+- **Total live memory**: **~20–26 B/node** (arena + unique table) on the truncated sweep, plus the fixed apply cache. Below OxiDD's ~30-32 B/live-node.
+- **Wall-clock time**: steady ~3× slower than OxiDD at the scales we measure (k=10..17 truncated mult).
 - **Generational storage API** (§4.15): `Slab` (arena bytes + roots) and `Diff` (tail-only delta against a known base) with a clean-bytes invariant — every public artifact is function-canonical, never carries ite scratch. The backward-delta codec makes minor GC write-barrier-free and tail bytes position-independent: any process starting from the same base produces bit-identical tail bytes for the same ops. Opens a "compute server" pattern where the client ships a base + ops, the server ships back the clean tail and drops its unique table.
 
 **Design trade-off, accepted explicitly**: within a small-constant factor of OxiDD on runtime, at roughly two-thirds of OxiDD's total engine memory. Persistence is caller-supplied (wrap `slab.bytes` in any container); the library stays focused on the engine and its in-memory exchange types.
@@ -184,22 +184,24 @@ Bitblasting `x*y=z` from scratch on a single thread, both engines in one test bi
 | 7 | 30,941 | ~30 | ~8.7 | 3.4× |
 | 8 | 122,309 | ~112 | ~37.5 | **3.0×** |
 
-**Large-k sweep** (`tests/timing_large.rs`, ignored by default; run with `--ignored`). Default max k=10; k=11 exceeds our 30 s budget for vwbdd:
+**Truncated-mult large-k sweep** — the iota-comparable workload, `(x·y) mod 2^k = z` over three k-bit uints. Measured May 2026 on an M3 Max, both engines in the same test harness (the `mult_trunc_timing.rs` sweep itself was retired after this measurement; correctness at small k is still checked by `mult_trunc_correctness.rs` in the default suite):
 
 | k | nodes | vwbdd (ms) | oxidd (ms) | ratio | arena B/n | total B/n |
 |--:|---:|---:|---:|---:|---:|---:|
-| 8  | 122,309   | 129     | 48     | **2.70×** | 3.94 | 14.66 |
-| 9  | 484,417   | 614     | 242    | **2.54×** | 4.11 | 14.94 |
-| 10 | 1,916,977 | 4,718   | 1,431  | 3.30× | 4.40 | 15.34 |
-| 11 | 7,596,181 | 39,386  | 17,546 | **2.24×** | 4.59 | 15.64 |
+|  7 |      2,632 |      8 |     47 | 0.17× | 3.87 | 17.87 |
+| 10 |     58,531 |     65 |     32 | 2.06× | 4.28 | 24.43 |
+| 12 |    464,181 |    471 |    152 | 3.11× | 4.79 | 25.12 |
+| 13 |  1,292,158 |  1,391 |    448 | 3.10× | 4.93 | 19.54 |
+| 14 |  3,697,095 |  4,262 |  1,437 | 2.97× | 5.01 | 25.43 |
+| 15 | 10,304,528 | 14,239 |  4,724 | 3.01× | 5.10 | 19.75 |
+| 16 | 29,511,257 | 48,376 | 13,761 | 3.52× | 5.20 | 25.67 |
+| 17 | 82,305,186 | 171,672 | 47,160 | 3.64× | 5.41 | 20.09 |
 
-**Ratios across k=8..11**: **2.2-3.3×**, with a **3.3× peak at k=10**. That k=10 peak is apply-cache thrashing: our direct-mapped cache is 2^17 = 131k slots, and at k=10 the working set is ~1.9M edges, ~14× cache capacity. Entries get evicted before they can be reused, forcing redundant recomputation. OxiDD's default cache is larger (~1M slots) so the threshold hits them later. At k=11, both engines are in a "cache-starved" regime relative to working set — but **vwbdd actually wins more ground at k=11 (2.24×)** than at smaller k, because the compact unique table and 2-MB packed apply cache both keep more of the working set in L2.
+**Ratios across k=10..17**: stable at **2.0–3.6×**, drifting slightly upward with k. The k=7 outlier (0.17×) is startup overhead favoring vwbdd when the workload is too small to amortize OxiDD's apply-cache allocation. The "total B/n" column alternates between ~20 and ~25 with parity of k because the unique table's power-of-two slot count snaps to a larger tier at specific thresholds.
 
-The cache size should probably be tunable. Left for a future session.
+**Arena compression**: 3.87 → 5.41 B/node across a 31,000× growth in node count (k=7 → k=17), consistent with LEB128 spending ~1 extra byte per 128× buffer growth. The compression ratio vs OxiDD's fixed 16 B/node stays at **3–4× smaller** throughout.
 
-**Arena compression extrapolates cleanly**: 3.94 → 4.59 B/node across a 62× growth in node count (k=8 → k=11), consistent with LEB128 spending ~1 extra byte per 128× buffer growth. Our compression ratio vs OxiDD's fixed 16 B/node stays at **3.5-4× smaller** throughout.
-
-**Total live memory (arena + unique table) dropped from ~36 to ~15 B/node** in §4.7's compact-table rewrite. Counting the apply cache as amortized overhead per live node, **§4.8 brought the grand total at k=11 to 15.9 B/live-node**, down from 16.8 B/live-node, against OxiDD's ~30-32 B/live-node (**~2× smaller engine**).
+**Total live memory (arena + unique table) stays at 20–26 B/node** vs OxiDD's ~30–32 B/live-node: a ~20–35% engine-wide win at scale.
 
 Progression across our optimizations, k=8 specifically:
 
@@ -936,16 +938,15 @@ vwbdd/
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
     ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
     ├── slab.rs                  — Slab/Diff roundtrips, extend_slab tail-only diffs, tail-GC correctness, the clean-bytes invariant (§4.15)
+    ├── slab_queries.rs          — Slab::support and Slab::sat_count read-only queries
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── mult.rs                  — full x*y=z relation for k=2..8, node count + mem + post-GC accounting
     ├── mult_shared/mod.rs       — shared vwbdd+OxiDD builders: full-relation (2k-bit z) and truncated (k-bit z) variants
     ├── mult_trunc_correctness.rs— truncated (iota-style) node counts at small k (§4.13)
-    ├── mult_trunc_timing.rs     — truncated mult vs OxiDD, matched to iota's demo workload (§4.13; #[ignore]'d)
-    ├── timing.rs                — wall-clock comparison vs OxiDD on full mult (k=4..8)
-    └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
+    └── timing.rs                — wall-clock comparison vs OxiDD on full mult (k=4..8)
 ```
 
-Total: 62 tests passing, 2 `#[ignore]`'d timing sweeps.
+Total: 70 tests passing. No `#[ignore]`d tests; the two benchmark sweeps (`timing_large.rs` for full-mult k=8..11 and `mult_trunc_timing.rs` for truncated k=7..17) were retired after their last measurement runs; the numbers they produced are recorded in §3.4.
 
 
 ## 8. The agility cut (what §4.12 and §4.14 gave and took back)
