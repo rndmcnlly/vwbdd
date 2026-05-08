@@ -176,3 +176,89 @@ impl Default for CompactUnique {
         Self::new()
     }
 }
+
+/// A family of per-variable unique tables.
+///
+/// Motivation: a single global `CompactUnique` at k=15 mult-trunc (10M
+/// nodes, ~150 MB table) is the #1 hot spot in a time-profile, with
+/// most cost attributable to DRAM-random-access probes. Partitioning
+/// by variable gives smaller per-table working sets, many of which fit
+/// in L2 during the construction phases where that variable is active.
+/// This is what CUDD and OxiDD do.
+///
+/// Each variable's nodes are hash-consed only against other nodes with
+/// the same variable, which is sound because the canonicity predicate
+/// `(var, lo, hi)` already partitions by `var`: no cross-var collisions
+/// are possible.
+///
+/// Empty-var tables (variable declared but never used as a node's `var`)
+/// stay at `INITIAL_CAP` slots — 9 KiB each — so the per-var overhead is
+/// ~9 KiB/var before the first insert. At the scales we target (fewer
+/// than 1000 vars), that's under 9 MiB of fixed overhead, an acceptable
+/// trade for the locality win on the hot probe path.
+pub struct UniqueTables {
+    tables: Vec<CompactUnique>,
+}
+
+impl UniqueTables {
+    pub fn new() -> Self {
+        Self { tables: Vec::new() }
+    }
+
+    /// Ensure there's a table for variable `var`. Called from `new_var`.
+    /// Idempotent (no-op if `var` is already covered).
+    pub fn ensure_var(&mut self, var: u32) {
+        let needed = var as usize + 1;
+        while self.tables.len() < needed {
+            self.tables.push(CompactUnique::new());
+        }
+    }
+
+    /// Total live entries across all per-var tables.
+    pub fn len(&self) -> usize {
+        self.tables.iter().map(|t| t.len()).sum()
+    }
+
+    /// Total bytes across all per-var tables, including empty ones.
+    pub fn bytes(&self) -> usize {
+        self.tables.iter().map(|t| t.bytes()).sum()
+    }
+
+    /// Look up `(var, lo, hi)` in the table for `var`. Returns the
+    /// existing offset on match or `None` on miss.
+    ///
+    /// Panics if `var` has not been registered via `ensure_var`.
+    #[inline]
+    pub fn lookup(&self, hash: u64, var: u32, lo: Ref, hi: Ref, buf: &[u8]) -> Option<u64> {
+        self.tables[var as usize].lookup(hash, var, lo, hi, buf)
+    }
+
+    /// Insert `offset` into the table for `var`. Caller must have
+    /// verified via `lookup` that the key is not present.
+    #[inline]
+    pub fn insert(&mut self, hash: u64, var: u32, offset: u64, buf: &[u8]) {
+        self.tables[var as usize].insert(hash, offset, buf);
+    }
+
+    /// Clear all per-var tables and pre-size each one for its expected
+    /// load after a full arena scan. Used by `rebuild_from_arena` /
+    /// `resize_for` equivalents.
+    pub fn reset_for(&mut self, per_var_expected: &[usize]) {
+        self.ensure_var(per_var_expected.len().saturating_sub(1) as u32);
+        for (v, table) in self.tables.iter_mut().enumerate() {
+            let expected = per_var_expected.get(v).copied().unwrap_or(0);
+            table.resize_for(expected);
+        }
+    }
+
+    /// Number of declared variable tables.
+    pub fn num_vars(&self) -> usize {
+        self.tables.len()
+    }
+}
+
+impl Default for UniqueTables {
+    fn default() -> Self {
+        Self::new()
+    }
+}

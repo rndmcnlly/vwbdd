@@ -19,7 +19,7 @@ Across the mult-relation `x*y=z` from k=2 to k=11 and the truncated `(x*y) mod 2
 - **Apply-cache compression** (§4.8, §4.11): a packed-ref encoding for the direct-mapped ite cache. 32 B/entry (half a cache line; two entries per line). Default cache total: **64 MiB**.
 - **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
 - **Total live memory**: **~20–26 B/node** (arena + unique table) on the truncated sweep, plus the fixed apply cache. Below OxiDD's ~30-32 B/live-node.
-- **Wall-clock time**: steady ~3× slower than OxiDD at the scales we measure (k=10..17 truncated mult).
+- **Wall-clock time**: ~2–3× slower than OxiDD at k=10..17 truncated mult, post-§4.17 (per-variable unique tables).
 - **Generational storage API** (§4.15): `Slab` (arena bytes + roots) and `Diff` (tail-only delta against a known base) with a clean-bytes invariant — every public artifact is function-canonical, never carries ite scratch. The backward-delta codec makes minor GC write-barrier-free and tail bytes position-independent: any process starting from the same base produces bit-identical tail bytes for the same ops. Opens a "compute server" pattern where the client ships a base + ops, the server ships back the clean tail and drops its unique table.
 
 **Design trade-off, accepted explicitly**: within a small-constant factor of OxiDD on runtime, at roughly two-thirds of OxiDD's total engine memory. Persistence is caller-supplied (wrap `slab.bytes` in any container); the library stays focused on the engine and its in-memory exchange types.
@@ -202,6 +202,8 @@ Bitblasting `x*y=z` from scratch on a single thread, both engines in one test bi
 **Arena compression**: 3.87 → 5.41 B/node across a 31,000× growth in node count (k=7 → k=17), consistent with LEB128 spending ~1 extra byte per 128× buffer growth. The compression ratio vs OxiDD's fixed 16 B/node stays at **3–4× smaller** throughout.
 
 **Total live memory (arena + unique table) stays at 20–26 B/node** vs OxiDD's ~30–32 B/live-node: a ~20–35% engine-wide win at scale.
+
+**Note**: the wall-clock numbers above are from the pre-§4.17 engine (single global unique table). After §4.17's per-variable unique tables, mult-trunc k=15 dropped from 14,239 ms to ~9,635 ms on the same machine — a 1.13× improvement. The other rows have not been re-measured but should see similar or larger wins at scales where the old single table exceeded L2 (k ≥ 12 approximately). The compression and memory columns are unchanged.
 
 Progression across our optimizations, k=8 specifically:
 
@@ -891,6 +893,59 @@ The decision recorded here is: **on our distribution, in our access pattern, wit
 The shootout harness isn't checked in (the measurement was taken once and the numbers were recorded; carrying a benchmark for a codec we didn't adopt is unjustified maintenance). To reproduce: add `vlen = "0.3"` as a dev-dep, collect child codes by scanning `m.arena_slice(0)` with `leb::decode_u128` after building a mult-trunc k=12 arena, and time best-of-3 encode/decode passes with both codecs. The distribution and ratios above are expected to be stable across machines; the absolute ns/value will vary. Revisit if (a) we move to substantially larger arenas where 5-byte+ child codes dominate, (b) vlen adds a streaming decoder that works on packed buffers without padding, or (c) we start shipping slabs in a context where CPU is the binding constraint (we're 3× slower than OxiDD right now; codec micro-wins aren't the lever).
 
 
+### 4.17 Per-variable unique tables
+
+A session-end profile (via `cargo instruments -t time --release --example mult_trunc_k15`) showed the top-of-stack self-time breakdown at k=15 truncated mult (10.3M nodes, 10.9 s wall, ~11,700 Running samples at 1 ms):
+
+| self-time % | function | category |
+|---:|---|---|
+| 24% | `CompactUnique::lookup` | unique-table probes |
+| 21% | `leb::decode_u128` | codec (mostly inside the probe verify path) |
+| 12% | `Manager::cofactor` | find-top-var + sub-ref pick |
+| 11% | `Manager::ite` | orchestration |
+| 11% | `Manager::decode_node` | full node decode |
+| 6% | `Manager::ite_cache_get` | apply-cache probe |
+| 5% | `CompactUnique::insert` | unique-table inserts |
+
+Broadly: ~50% of time in unique-table machinery, ~30% in codec work (most of it triggered by the probe's verify-on-decode path in §4.7), ~20% in ite orchestration. At this scale the unique table is ~100 MB of `CompactUnique` slots out of ~150 MB total engine memory: every probe is plausibly a DRAM round-trip. Memory hierarchy, not instruction throughput, is the binding constraint.
+
+The obvious lever: **replace the single global unique table with one per variable.** Each variable's nodes are hash-consed only against other nodes with the same variable, which is sound because the canonicity predicate `(var, lo, hi)` already partitions by `var`. Smaller sub-tables fit in L2/L3 during the construction phases where that variable is active. CUDD and OxiDD both do this.
+
+The implementation was ~60 net lines: a `UniqueTables` wrapper over `Vec<CompactUnique>` with a per-var `insert` and `lookup`, plus an `ensure_var` hook in `Manager::new_var` to register tables lazily. `CompactUnique` itself is unchanged. The hash function still includes `var` — a constant per-var offset is harmless and keeps the probe arithmetic identical.
+
+Measured on the same machine and workload:
+
+| metric | before | after | delta |
+|---|---:|---:|---:|
+| wall | 10,885 ms | 9,635 ms | **1.13× faster** |
+| arena | 4.74 B/n | 4.74 B/n | unchanged |
+| total (arena + unique) | 24.79 B/n | 24.66 B/n | slightly smaller |
+| reachable nodes | 10,304,528 | 10,304,528 | identical |
+
+Decomposing by function (absolute ms, derived from the 1 ms sample rate × wall-clock):
+
+| function | before (ms) | after (ms) | ∆ (ms) | note |
+|---|---:|---:|---:|---|
+| `leb::decode_u128` | 2,647 | 1,691 | **−956** | fewer verify-on-decode calls from smaller probe chains |
+| `CU::insert` | 1,625 | 622 | **−1,003** | smaller tables ⇒ shorter probes and cheaper resizes |
+| `make_node` | 1,428 | 175 | −1,253 | inlining shifted; real win smaller, shows up as moves to other frames below |
+| `ite` | 1,710 | 1,038 | −672 | less pressure on the apply-cache hashmap |
+| `ite_cache_get` | 1,174 | 642 | −532 | same |
+| `CU::lookup` | 615 | 2,260 | +1,644 | inlining shifted self-time; not a regression |
+| `cofactor` | 0 | 1,332 | +1,332 | inlined into `ite` before, distinct now |
+| `decode_node` | 149 | 1,164 | +1,015 | same inlining shift |
+
+The positive deltas on lookup/cofactor/decode_node are not regressions; they're the same work showing up as direct self-time instead of inlined into callers. The sum of deltas (roughly −600 ms at the >30 ms threshold) underestimates the true −1,250 ms wall delta because many small functions fall below the reporting threshold.
+
+**What worked**: the `CU::insert` 2.6× improvement was the biggest single contributor. Insert cost is dominated by linear-probe walks and by rehash-at-resize; both degrade with table size. Many small tables let each individual resize touch only that variable's entries, not the whole 10M-node corpus.
+
+**What didn't matter**: the absolute memory footprint is unchanged within the measurement noise. The cost model "smaller tables stay in L2" probably is operative, but we can't separate it from the cost-model "smaller resizes cost less in aggregate" with this measurement alone. A cycle-counter breakdown would tell us, but the 13% wall-clock win is reason enough not to chase further.
+
+**One small caveat.** Each per-var table starts at `INITIAL_CAP = 1024` slots = 9 KiB, so N declared variables cost ~9N KiB of fixed overhead before the first insert. At k=15 (45 vars) that's 405 KiB, invisible against a 150 MB engine. At thousands of variables this baseline matters; revisit the starting capacity if that regime becomes relevant.
+
+**Reproducing the measurement.** An `examples/mult_trunc_k15.rs` binary in the tree produces the workload at a scale that fits a single Instruments recording. The whole loop from `cargo instruments -t time --release --example mult_trunc_k15` to a symbolized flat self-time histogram takes a couple of minutes on an M3 Max. Trace files land under `target/instruments/`; the export-to-XML + `atos` resolution steps used here are standard macOS sampling-profiler plumbing.
+
+
 ## 5. What's still missing
 
 Things we'd want before calling this a real engine:
@@ -954,9 +1009,11 @@ vwbdd/
 │   ├── leb.rs                   — unsigned LEB128 u128 encode/decode
 │   ├── codec.rs                 — Ref, Node, encode_node/decode_node/decode_var (§8)
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
-│   ├── unique.rs                — CompactUnique: linear-probe unique table (u64 slots) (§4.7, §8)
-│   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15)
+│   ├── unique.rs                — CompactUnique (linear-probe unique table, u64 slots) + UniqueTables (per-var family, §4.7, §4.17)
+│   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15). Also Slab::support, Slab::sat_count.
 │   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots, gc (generational, §4.15), apply cache (§4.13)
+├── examples/
+│   └── mult_trunc_k15.rs        — profiling target for `cargo instruments`, inlines its own mult-trunc builders (§4.17)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
     ├── node.rs                  — per-node encode/decode

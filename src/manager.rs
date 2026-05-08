@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::codec::{decode_node, decode_var, encode_node, Node, Ref, ref_to_u64};
-use crate::unique::{unique_key_hash, CompactUnique};
+use crate::unique::{unique_key_hash, UniqueTables};
 
 /// Fast mixing hash for an (f, g, h) ite-cache triple. Splitmix-style chain.
 #[inline]
@@ -145,7 +145,7 @@ pub struct Manager {
     buf: Vec<u8>,
     /// Unique table: compact linear-probe, u64 offsets + u8 tags,
     /// 0.75 load factor on power-of-two sizes.
-    unique: CompactUnique,
+    unique: UniqueTables,
     num_vars: u32,
     /// Direct-mapped ite apply cache. Fixed-size (set at construction);
     /// collisions evict. See [`ManagerConfig::with_cache_slots`].
@@ -179,7 +179,7 @@ impl Manager {
             vec![IteCacheEntry::EMPTY; slots].into_boxed_slice();
         Self {
             buf: Vec::new(),
-            unique: CompactUnique::new(),
+            unique: UniqueTables::new(),
             num_vars: 0,
             ite_cache,
             ite_cache_mask: (slots as u64) - 1,
@@ -190,6 +190,7 @@ impl Manager {
     pub fn new_var(&mut self) -> u32 {
         let v = self.num_vars;
         self.num_vars += 1;
+        self.unique.ensure_var(v);
         v
     }
 
@@ -296,7 +297,7 @@ impl Manager {
         }
         let new_off = self.buf.len() as u64;
         encode_node(var, lo, hi, new_off, &mut self.buf);
-        self.unique.insert(hash, new_off, &self.buf);
+        self.unique.insert(hash, var, new_off, &self.buf);
         Ref::Node(new_off)
     }
 
@@ -620,24 +621,34 @@ impl Manager {
 
     /// Rebuild the unique table by scanning the current arena in
     /// construction order. Called after GC or after a slab ingest.
+    ///
+    /// Two passes: first count per-variable live nodes so each per-var
+    /// table can be pre-sized at 0.75 load (avoiding a cascade of
+    /// resizes during reinsertion); second pass actually inserts.
     fn unique_rebuild_from_arena(&mut self) {
-        let mut live = 0usize;
+        // Pass 1: per-var histogram.
+        let mut per_var: Vec<usize> = vec![0; self.num_vars as usize];
         {
             let mut pos: usize = 0;
             while pos < self.buf.len() {
                 let off = pos as u64;
-                let (_, len) = decode_node(&self.buf[pos..], off);
-                live += 1;
+                let (node, len) = decode_node(&self.buf[pos..], off);
+                if (node.var as usize) >= per_var.len() {
+                    per_var.resize(node.var as usize + 1, 0);
+                }
+                per_var[node.var as usize] += 1;
                 pos += len;
+                let _ = off;
             }
         }
-        self.unique.resize_for(live);
+        self.unique.reset_for(&per_var);
+        // Pass 2: reinsert.
         let mut pos: usize = 0;
         while pos < self.buf.len() {
             let off = pos as u64;
             let (node, len) = decode_node(&self.buf[pos..], off);
             let hash = unique_key_hash(node.var, node.lo, node.hi);
-            self.unique.insert(hash, off, &self.buf);
+            self.unique.insert(hash, node.var, off, &self.buf);
             pos += len;
         }
     }
