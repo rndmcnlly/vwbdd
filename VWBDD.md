@@ -14,17 +14,17 @@ Across the mult-relation `x*y=z` from k=2 to k=11 (reachable nodes 29 to 7.6M):
 
 - **Correctness**: node counts match OxiDD exactly at every scale, verified differentially via a shared bitblaster running both engines in the same test.
 - **Arena compression**: post-GC, we store BDD nodes at **2.6 to 4.6 bytes each** (k=2 to k=11) vs OxiDD's fixed 16 B/node. Dominant factor is the byte-offset distance to child nodes, which LEB128 compresses well.
-- **Parameterized engine** (§4.12): `Manager<C: NodeCodec, O: ArenaOffset>`. Default `DefaultManager = Manager<Leb128Codec, u32>` is the compact build (4 GiB arena cap, ~6.7 B/node unique-table density — right for wasm clients and other memory-tight deployments). `LargeManager = Manager<Leb128Codec, u64>` lifts the arena ceiling to host RAM for server-side builders, at ~12 B/node density. Single library, two monomorphizations, picked by type alias at the call site.
-- **Unique-table compression** (§4.7): `CompactUnique` — struct-of-arrays offset slots + parallel hash tags. u32 default at **~6.7 B/node**; u64 large-arena at **~12 B/node**. Both far below the 32 B/node a generic `HashMap<u64,u64>` would cost.
-- **Apply-cache compression** (§4.8, §4.11): a packed-ref encoding per offset width. Default (u32) gives 16 B entries (one 64 B cache line); u64 gives 32 B entries (two per line). Default cache total: **2 MB**. Large-arena cache total: 4 MB.
+- **Single concrete engine**: one `Manager`, u64 arena offsets, one `Leb128Codec` — no trait parameterization. The §4.12 `Manager<C: NodeCodec, O: ArenaOffset>` experiment was retired in §8 on agility grounds; what remains is the working concrete configuration.
+- **Unique-table compression** (§4.7): `CompactUnique` — struct-of-arrays offset slots + parallel hash tags at **~12 B/node**, well below the 32 B/node a generic `HashMap<u64,u64>` would cost.
+- **Apply-cache compression** (§4.8, §4.11): a packed-ref encoding for the direct-mapped ite cache. 32 B/entry (half a cache line; two entries per line). Default cache total: **64 MiB**.
 - **Decode fast path** (§4.10): raw u8 `var` + three per-field LEB128s, after an A/B showed that interleaving pair-math and LEB-encoding the var were both costly without winning bytes at our scale.
-- **Total live memory (default build)**: **~15-16 B/node** (arena + unique table), plus a 2 MB fixed apply cache. Grand total at k=11: **~121 MB for 7.6M nodes**. About half of OxiDD's ~30-32 B/live-node.
-- **Wall-clock time**: **1.75× slower than OxiDD** at k=11 on the default build (§4.12 post-parameterization; the monomorphized u32 engine is 14-21% faster than the single-width u64 engine of §4.11).
+- **Total live memory**: **~20 B/node** (arena + unique table), plus the fixed apply cache. Roughly two-thirds of OxiDD's ~30-32 B/live-node.
+- **Wall-clock time**: order of ~1.5–2× slower than OxiDD at k=11.
 - **Generational storage API** (§4.15): `Slab` (arena bytes + roots) and `Diff` (tail-only delta against a known base) with a clean-bytes invariant — every public artifact is function-canonical, never carries ite scratch. The backward-delta codec makes minor GC write-barrier-free and tail bytes position-independent: any process starting from the same base produces bit-identical tail bytes for the same ops. Opens a "compute server" pattern where the client ships a base + ops, the server ships back the clean tail and drops its unique table.
 
-**Design trade-off, accepted explicitly**: within ~3× of OxiDD on runtime, at ~half OxiDD's total engine memory *and* unlimited-arena scaling when you need it. The §4.12 parameterization removed the prior either/or: no longer does the server-side build and the wasm-client build have to choose between compactness and capacity. The wasm client runs `DefaultManager` at 15-16 B/node with a 4 GiB arena ceiling; the server builds with `LargeManager` at ~25 B/node and can absorb up to ~40B live nodes in 1 TB of RAM. The serialized arena is codec-compatible across widths because `Leb128Codec` encodes the same bytes either way; the receiving engine just uses its own offset type to index them.
+**Design trade-off, accepted explicitly**: within a small-constant factor of OxiDD on runtime, at roughly two-thirds of OxiDD's total engine memory. Persistence is caller-supplied (wrap `slab.bytes` in any container); the library stays focused on the engine and its in-memory exchange types.
 
-Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design. §4.11 records the u32 → u64 widening that lifted the 4 GiB arena ceiling (but ran into footprint regression on small cases). §4.12 resolved that tension with a compile-time parameterization. §4.14 added multi-process partition-and-merge via dump/load/absorb. §4.15 unified those under Slab/Diff types, added minor GC, and made the clean-bytes invariant load-bearing — along the way surfacing a measurable gap between *function-canonical* (what the invariant delivers) and *byte-canonical* (what a content-addressable slab format would need).
+Four rejected optimizations earn their own sections: §4.4 (abs+rel hybrid addressing; the 2023 notebook's trick didn't transfer), §4.6 (four hand-rolled unique-table variants, all regressed), and §4.9 (cuckoo-4-slot at 0.85 load — accurate memory prediction, speed prediction wrong by 2-3×). §4.10 documents the A/B that validated the current simple per-field design. §4.11 records the u32 → u64 widening that lifted the 4 GiB arena ceiling. §4.12 generalized into a `Manager<C: NodeCodec, O: ArenaOffset>` with u32 and u64 aliases. §4.14 added a native `.vwbdd` dump/load/absorb format for multi-process merge. §4.15 unified in-memory exchange under Slab/Diff types, added minor GC, and made the clean-bytes invariant load-bearing — surfacing a measurable gap between *function-canonical* (what the invariant delivers) and *byte-canonical* (what a content-addressable slab format would need). **§8** records the agility cut that retired `NodeCodec`, the `ArenaOffset` trait, and the `.vwbdd` file format, reducing the source surface by ~37% LOC while preserving every non-serialization test.
 
 
 ## 1. Motivation
@@ -921,25 +921,22 @@ vwbdd/
 ├── Cargo.toml                   — zero runtime deps; dev-dep on ../oxidd/crates/oxidd
 ├── VWBDD.md                     — this document
 ├── src/
-│   ├── lib.rs                   — module glue, public re-exports, type aliases (§4.12)
+│   ├── lib.rs                   — module glue and public re-exports
 │   ├── leb.rs                   — unsigned LEB128 u128 encode/decode
-│   ├── codec.rs                 — ArenaOffset + NodeCodec traits; Leb128Codec impl (§4.12)
+│   ├── codec.rs                 — Ref, Node, encode_node/decode_node/decode_var (§8)
 │   ├── node.rs                  — compatibility shim: free-function wrappers for tests/node.rs
-│   ├── unique.rs                — CompactUnique<C, O>: linear-probe, generic slot width (§4.7)
-│   ├── dump.rs                  — .vwbdd native format: dump/load/absorb multi-root with CRC32 (§4.14); dump/dump_named now pre-GC to enforce the clean-bytes invariant (§4.15)
+│   ├── unique.rs                — CompactUnique: linear-probe unique table (u64 slots) (§4.7, §8)
 │   ├── slab.rs                  — Slab + Diff types and the generational API: ingest/slab_for/diff_since/apply_diff/extend_slab, the clean-bytes invariant (§4.15)
-│   └── manager.rs               — live engine: Manager<C, O>, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots (aliased to gc), gc_tail (minor-GC, §4.15), apply cache (§4.13)
+│   └── manager.rs               — live engine: Manager, ManagerConfig, make_node, ite, and/or/xor/not, drop_roots (aliased to gc), gc_tail (minor-GC, §4.15), apply cache (§4.13)
 └── tests/
     ├── leb.rs                   — LEB128 roundtrips
-    ├── node.rs                  — per-node encode/decode (default u32)
+    ├── node.rs                  — per-node encode/decode
     ├── manager.rs               — manager basics, reduction, canonicity, ordering
     ├── ite.rs                   — boolean op identities, node counts for small formulas
     ├── gc.rs                    — copying GC preserves semantics, shrinks manager
     ├── cache_config.rs          — ManagerConfig / with_cache_slots builder tests (§4.13)
-    ├── dump.rs                  — .vwbdd roundtrip: single/multi-root, named, absorb dedup, error paths (§4.14), clean-bytes invariant on dump (§4.15)
     ├── slab.rs                  — Slab/Diff roundtrips, extend_slab tail-only diffs, minor-GC (gc_tail) correctness, the clean-bytes invariant (§4.15)
     ├── minor_gc_savings.rs      — benchmark: what the clean-bytes invariant costs at the wire, across simple/mixed/fat extend shapes (§4.15; #[ignore]'d)
-    ├── large_manager.rs         — LargeManager smoke + u32/u64 cross-width agreement (§4.12)
     ├── differential.rs          — runs vwbdd and OxiDD on the same formulas, asserts node-count equality
     ├── compression.rs           — bytes/node on AND chain, XOR parity, threshold
     ├── mult.rs                  — full x*y=z relation for k=2..8, node count + mem + post-GC accounting
@@ -950,5 +947,105 @@ vwbdd/
     └── timing_large.rs          — full-relation large-k sweep (#[ignore]'d; k=8..11)
 ```
 
-Total: 78 tests passing, 4 #[ignore]'d sweeps (three timing, one invariant-cost benchmark).
+Total: 65 tests passing, 3 `#[ignore]`'d sweeps (two timing, one invariant-cost benchmark).
 
+
+## 8. The agility cut (what §4.12 and §4.14 gave and took back)
+
+The engine grew three parameterization axes over its life: a `NodeCodec`
+trait (§4.10 groundwork), an `ArenaOffset` trait gating u32/u64 (§4.12),
+and a full on-disk dump format (§4.14). Each was earned by a concrete
+requirement at the time. In aggregate, they slowed iteration: every
+type signature carried `<C: NodeCodec<O>, O: ArenaOffset>`, every test
+that poked internals paid turbofish tax, and two nearly-parallel
+serialization stories (`Slab`/`Diff` in-memory, `dump`/`load`/`absorb`
+on-disk) had to stay in sync. Token budget for an agent reading the
+codebase grew faster than the engine's capability.
+
+The cut, decided against the "recommended" defaults in a session
+focused on restoring curiosity-per-keystroke:
+
+- **Retired `NodeCodec`.** Only `Leb128Codec` ever existed. The trait
+  was optionality we weren't using. Deleted the trait, the
+  `PhantomData<C>` tax on `Manager` / `CompactUnique`, and the
+  `impl<C: NodeCodec<O>, O: ArenaOffset>` prefix on every method
+  block. `encode_node` / `decode_node` / `decode_var` are now free
+  functions in `src/codec.rs` with concrete `u64` offsets.
+
+- **Collapsed to u64 offsets.** Picked native-word-width over
+  wasm-first compactness. The "VW" in VWBDD was always about
+  variable-width *nodes* (LEB128 child codes); conflating that with
+  variable-width *arena addressing* was scope creep. The u32 build's
+  §4.8 cache-line-packed `IteCacheEntry` trick is gone with the
+  generic; at u64 the entry is 32 B (half a line, two per line),
+  which was already the §4.11 fallback. `PackedRef` stays as a
+  single-u64 slot packing (0=F, 1=T, 2=empty, 3+off=Node) — small
+  and self-contained.
+  - Unique-table density: **~12 B/node** (was ~6.7 B/node on the
+    retired u32 build). The compact-first story is recoverable with a
+    cargo feature if a wasm deployment ever asks for it; the mechanism
+    (swap `u64` → `u32` across a few files) is shallow.
+
+- **Dropped `src/dump.rs` and `tests/dump.rs`.** The `.vwbdd` file
+  format (header, CRC32, named roots, offset-width field) duplicated
+  what `Slab` already carries in memory. Callers who want persistence
+  can wrap `slab.bytes` in any container they like (gzip+sha256 in a
+  server cache, a Parquet cell, a WebSocket frame). The multi-process
+  `absorb` story is the one concrete thing `dump` bought: callers that
+  need it should rebuild it on top of `ingest_slab` + a caller-chosen
+  serializer.
+
+### What it bought us
+
+| metric                       | before | after | change |
+|------------------------------|-------:|------:|-------:|
+| `src/` LOC                   |  2,711 | 1,440 |   −47% |
+| `tests/` LOC                 |  2,319 | 1,753 |   −24% |
+| total LOC                    |  5,030 | 3,193 |   −37% |
+| `src/manager.rs` LOC         |    941 |   588 |   −38% |
+| generic parameters on `Manager` |    2 |     0 |       |
+| passing tests (correctness)  |     78 |    65 |  −13*  |
+| wall-clock perf vs OxiDD     |  ~1.75× slower |  same order |    —  |
+
+\* The 13 dropped tests were all serialization coverage: 8 from
+`tests/dump.rs` (dump/load/absorb file round-trips) and 5 from
+`tests/large_manager.rs` (cross-width u32/u64 agreement). Every
+correctness test over the engine proper still passes.
+
+### What it cost
+
+- **4 GiB arena cap on wasm** was possible at u32; now it's a
+  same-code, larger-unique-table build. The wasm client pays ~12 B/node
+  of unique-table overhead instead of ~6.7. Arena bytes themselves are
+  unchanged (LEB128 encodes absolute values, not offset widths).
+- **Persistence is now BYO-container.** No native `.vwbdd` file
+  format; callers who were reading files lose that path.
+- **Multi-process merge** (§4.14's `absorb`) is gone from the library
+  surface. Re-buildable on top of `ingest_slab` plus any caller-chosen
+  transport.
+
+### When to revisit
+
+- If wasm-client density becomes the binding constraint: feature-gate
+  `type Off = u32;` in `codec.rs` and regenerate. The code paths below
+  the `Off` type alias (`unique.rs`, `manager.rs`, `slab.rs`) are
+  already written in terms of a single offset type and will flip
+  without semantic changes.
+- If persistence matters again: the simplest reconstitution is a
+  one-line helper that writes `[u32 len][slab.bytes][u32 roots_count][roots…]`
+  to a file. ~30 lines of code, nothing like the 549-line `dump.rs`
+  that preceded it.
+- If multi-worker BDD construction re-enters the roadmap: the merge
+  primitive is semantically `m.ingest_slab(base); m.apply_diff(diff₁);
+  m.apply_diff(diff₂); …` when every worker shares the same base. No
+  new format needed.
+
+### The principle
+
+Generality has a carrying cost. A type parameter survives every
+refactor, every type-signature search, every agent context window.
+Pay it only when there is a second user (a second codec, a second
+offset width, a second exchange path) *on the floor of this
+workspace*. "We might want X later" is an unpaid debt: delete the
+placeholder, let a future collaborator reintroduce the generic when
+they have two concrete instances to satisfy.

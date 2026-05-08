@@ -238,9 +238,8 @@ fn extend_with_no_ops_produces_empty_tail() {
     // anything new, the tail is zero bytes and no new roots.
     let base = build_base();
 
-    // Type-annotate via an intermediate `Manager` alias so the compiler
-    // can pick `C = Leb128Codec, O = u32` when the closure body gives
-    // it no hints (no Manager method calls that would disambiguate).
+    // Type-annotate the closure arg so type inference sees `Manager`
+    // even when the body gives it no disambiguating calls.
     let diff: Diff = Manager::extend_slab(&base, |_m: &mut Manager, _base_roots| Vec::new());
 
     assert_eq!(diff.tail.len(), 0, "no ops, no tail");

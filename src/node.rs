@@ -1,29 +1,21 @@
-//! Compatibility shim re-exporting the default (u32-offset Leb128) codec
-//! surface as free functions. This file existed before the codec abstraction
-//! landed; keeping the free functions lets existing tests that poke the
-//! codec directly (e.g. `tests/node.rs`) stay readable and unchanged.
-//!
-//! For the parameterized types and the `NodeCodec` / `ArenaOffset` traits,
-//! see `src/codec.rs`.
+//! Free-function wrappers over the node codec for tests that roundtrip
+//! bytes directly. New code should use the functions in `codec` directly.
 
-pub use crate::codec::{code_to_ref, ref_to_code, ref_to_u64, Leb128Codec, Node, NodeCodec, Ref};
+pub use crate::codec::{code_to_ref, decode_node, decode_var, encode_node, ref_to_code, ref_to_u64, Node, Ref};
 
-// Free-function wrappers over the default codec at the default (u32) width.
-// Matches the pre-parameterization API; exists for backward compat of the
-// `tests/node.rs` roundtrip tests. New code should go through
-// `<Leb128Codec as NodeCodec<O>>::encode` directly.
+// Thin aliases for the pre-refactor names still used by `tests/node.rs`.
 
 #[inline]
 pub fn encode_node_at(var: u32, lo: Ref, hi: Ref, current_offset: u64, out: &mut Vec<u8>) {
-    <Leb128Codec as NodeCodec<u32>>::encode(var, lo, hi, current_offset as u32, out)
+    encode_node(var, lo, hi, current_offset, out)
 }
 
 #[inline]
 pub fn decode_node_at(buf: &[u8], current_offset: u64) -> (Node, usize) {
-    <Leb128Codec as NodeCodec<u32>>::decode(buf, current_offset as u32)
+    decode_node(buf, current_offset)
 }
 
 #[inline]
 pub fn decode_var_at(buf: &[u8], current_offset: u64) -> (u32, usize) {
-    <Leb128Codec as NodeCodec<u32>>::decode_var(buf, current_offset as u32)
+    decode_var(buf, current_offset)
 }
